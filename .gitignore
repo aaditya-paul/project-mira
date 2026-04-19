@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Logs
+*.log
+mira_debug.log
+
+# Mira Temp/Debug
+debug_vision.png
+_switch_app.ps1
+_launch_app.ps1
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
