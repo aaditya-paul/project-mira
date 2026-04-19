@@ -1,4 +1,9 @@
+
+<img width="1157" height="431" alt="image" src="https://github.com/user-attachments/assets/fc94225d-6dae-457f-bd8c-7a4086043415" />
+
+
 # Project Mira: Autonomous Desktop Agent
+
 
 Project Mira is a high-performance, autonomous desktop automation agent designed to execute complex tasks using a **Plan-Execute** architecture. Unlike reactive agents that rely on expensive vision loops for every action, Mira generates a granular JSON task plan and executes it directly using non-vision verification (window title/process checks) to ensure speed and predictability.
 
