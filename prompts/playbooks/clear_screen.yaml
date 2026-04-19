@@ -1,0 +1,23 @@
+name: clear_screen
+description: "Clear the current screen by closing all windows and switching to the desktop"
+
+triggers:
+  - "clear my screen"
+  - "clear screen"
+  - "empty desktop"
+  - "show desktop"
+
+variables:
+  none:
+    description: "No variables required"
+
+steps:
+  - action: type_keyboard
+    params:
+      hotkey: "win+d"
+    description: "Show the desktop by pressing Win+D"
+    expect: "desktop_shown"
+    risk_level: "low"
+    notes: >
+      Pressing Win+D will minimize all windows and show the desktop.
+      This is a reliable way to clear the screen without closing any applications.

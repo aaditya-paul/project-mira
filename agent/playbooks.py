@@ -155,7 +155,9 @@ RULES:
 3. For URL aliases (like "emails" → "gmail.com"), resolve them automatically.
 4. For "compose" variables (like messages), write a natural, conversational message as if YOU are the user speaking to their friend. Include greetings, proper tone, and the key information.
 5. Use the USER PROFILE data when relevant (e.g., default browser).
-6. If the task doesn't match ANY playbook well, set playbook to "none".
+6. Treat "open_app" and "open_url" as generic playbooks. Use them ONLY for pure open/switch/navigation requests with no additional objective.
+7. If the task includes a secondary objective (send/message/DM/play/search/etc.) and no specialized playbook matches, set playbook to "none" so a new playbook can be created.
+8. If the task doesn't match ANY playbook well, set playbook to "none".
 
 OUTPUT FORMAT: Return ONLY valid JSON. No markdown, no explanation.
 {{
@@ -169,6 +171,7 @@ Task: "check my emails" → {{"playbook": "open_url", "variables": {{"url": "gma
 Task: "tell june I'll be late" → {{"playbook": "send_whatsapp", "variables": {{"contact": "June", "message": "Hey June, just wanted to let you know I'll be running a bit late. I'll be there soon!"}}, "reasoning": "User wants to send a message to June via WhatsApp"}}
 Task: "search for the best restaurants in NYC" → {{"playbook": "search_web", "variables": {{"query": "best restaurants in NYC"}}, "reasoning": "User wants to search the web for restaurant info"}}
 Task: "open spotify" → {{"playbook": "open_app", "variables": {{"app": "Spotify"}}, "reasoning": "User wants to open Spotify application"}}
+Task: "open instagram and send a dm to rajdeep" → {{"playbook": "none", "variables": {{}}, "reasoning": "Task has a messaging objective; use a specialized DM playbook, not generic open_app/open_url"}}
 Task: "deploy my kubernetes cluster" → {{"playbook": "none", "variables": {{}}, "reasoning": "No playbook covers Kubernetes deployment"}}"""
 
         for provider in fallback_chain:

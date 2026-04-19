@@ -10,6 +10,7 @@ This is the core of the plan→act→VERIFY→correct loop.
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlparse
 
 from agent.state import AgentState, RiskLevel
 
@@ -100,6 +101,8 @@ class Verifier:
                 status=VerifyStatus.SKIPPED,
                 reason="Mouse move is low-risk, no verification needed",
             )
+        elif action.startswith("browser_"):
+            return self._verify_browser_action(state, action, params, action_result)
         else:
             return VerifyResult(
                 status=VerifyStatus.SKIPPED,
@@ -108,9 +111,290 @@ class Verifier:
 
     def _has_error(self, result: str) -> bool:
         """Check if an action result indicates an error."""
-        error_signals = ["failed", "error", "not found", "timeout", "exception"]
+        error_signals = ["failed", "error", "not found", "timeout", "timed out", "exception"]
         result_lower = result.lower()
         return any(sig in result_lower for sig in error_signals)
+
+    def _verify_browser_action(self, state: AgentState, action: str, params: dict, result: str) -> VerifyResult:
+        """Verify browser_* actions using live browser state, not only result strings."""
+        active = self._get_active_window()
+        current_title = active.get("window_title", "").lower()
+        current_process = active.get("process_name", "").lower()
+        state.update_window(current_title, current_process)
+
+        result_lower = (result or "").lower()
+
+        if action == "browser_navigate":
+            return self._verify_browser_navigate(params, result)
+
+        if action == "browser_type":
+            return self._verify_browser_type(params, result)
+
+        if action == "browser_wait_for":
+            return self._verify_browser_wait_for(params, result)
+
+        success_signals = {
+            "browser_click": ("clicked element",),
+            "browser_press_key": ("pressed key",),
+            "browser_get_text": ("page:", "url:"),
+            "browser_get_state": ("active tab:", "open tabs"),
+            "browser_new_tab": ("opened new",),
+            "browser_close_tab": ("closed tab",),
+            "browser_scroll": ("scrolled",),
+        }
+
+        signals = success_signals.get(action, ())
+        if signals and any(sig in result_lower for sig in signals):
+            return VerifyResult(
+                status=VerifyStatus.PASSED,
+                reason=f"{action} succeeded: {result[:120]}",
+            )
+
+        if action in {"browser_get_state", "browser_get_text"} and result:
+            return VerifyResult(
+                status=VerifyStatus.PASSED,
+                reason=f"{action} returned browser content",
+            )
+
+        return VerifyResult(
+            status=VerifyStatus.SKIPPED,
+            reason=f"{action} executed; no strong verification signal available",
+        )
+
+    def _get_browser_page(self):
+        try:
+            from agent.browser import BrowserController
+
+            controller = BrowserController.get_instance()
+            if not controller.ensure_connected():
+                return None
+            return controller.get_active_page()
+        except Exception as e:
+            logger.warning(f"Could not read browser page for verification: {e}")
+            return None
+
+    def _clean_host(self, host: str) -> str:
+        host = (host or "").lower().strip()
+        return host[4:] if host.startswith("www.") else host
+
+    def _normalize_url(self, url: str) -> str:
+        url = (url or "").strip()
+        if not url:
+            return ""
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        return url
+
+    def _url_matches_expected(self, actual_url: str, expected_url: str) -> bool:
+        expected_norm = self._normalize_url(expected_url)
+        if not expected_norm:
+            return True
+
+        try:
+            actual = urlparse(actual_url)
+            expected = urlparse(expected_norm)
+        except Exception:
+            return False
+
+        actual_host = self._clean_host(actual.hostname or "")
+        expected_host = self._clean_host(expected.hostname or "")
+        if expected_host:
+            if actual_host != expected_host and not actual_host.endswith(f".{expected_host}"):
+                return False
+
+        expected_path = (expected.path or "").rstrip("/")
+        actual_path = (actual.path or "").rstrip("/")
+        if expected_path and expected_path != "/" and not actual_path.startswith(expected_path):
+            return False
+
+        return True
+
+    def _target_contains_text(self, target, text: str) -> bool:
+        probe = (text or "").strip().lower()
+        if not probe:
+            return True
+
+        try:
+            current = target.input_value(timeout=300) or ""
+            if probe in current.lower():
+                return True
+        except Exception:
+            pass
+
+        try:
+            current = target.evaluate(
+                """(el) => {
+                    if (!el) return "";
+                    if (typeof el.value === "string") return el.value;
+                    return typeof el.textContent === "string" ? el.textContent : "";
+                }"""
+            ) or ""
+            if probe in current.lower():
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _verify_browser_navigate(self, params: dict, result: str) -> VerifyResult:
+        expected_url = params.get("url", "")
+        page = self._get_browser_page()
+        if not page:
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason="browser_navigate could not confirm active browser page",
+                should_trigger_vision=True,
+            )
+
+        actual_url = getattr(page, "url", "") or ""
+        actual_title = ""
+        try:
+            actual_title = page.title()
+        except Exception:
+            pass
+
+        if expected_url and not self._url_matches_expected(actual_url, expected_url):
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason=(
+                    f"browser_navigate mismatch: expected '{self._normalize_url(expected_url)}' "
+                    f"but active URL is '{actual_url}'"
+                ),
+                should_trigger_vision=True,
+            )
+
+        try:
+            visibility = page.evaluate("() => document.visibilityState || 'visible'")
+            if visibility != "visible":
+                return VerifyResult(
+                    status=VerifyStatus.FAILED,
+                    reason=f"browser_navigate landed on hidden tab ({actual_url})",
+                    should_trigger_vision=True,
+                )
+        except Exception:
+            pass
+
+        return VerifyResult(
+            status=VerifyStatus.PASSED,
+            reason=f"browser_navigate confirmed: {actual_title} ({actual_url})",
+        )
+
+    def _verify_browser_type(self, params: dict, result: str) -> VerifyResult:
+        selector = str(params.get("selector", "")).strip()
+        expected_text = str(params.get("text", ""))
+        page = self._get_browser_page()
+        if not page:
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason="browser_type could not confirm active browser page",
+                should_trigger_vision=True,
+            )
+
+        if not selector:
+            return VerifyResult(
+                status=VerifyStatus.SKIPPED,
+                reason="browser_type selector missing; cannot verify target field",
+            )
+
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+        except Exception as e:
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason=f"browser_type verification could not query selector '{selector}': {e}",
+                should_trigger_vision=True,
+            )
+
+        if count == 0:
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason=f"browser_type target selector '{selector}' not found after typing",
+                should_trigger_vision=True,
+            )
+
+        for i in range(min(count, 8)):
+            target = locator.nth(i)
+            try:
+                if self._target_contains_text(target, expected_text):
+                    return VerifyResult(
+                        status=VerifyStatus.PASSED,
+                        reason=f"browser_type confirmed text in selector '{selector}'",
+                    )
+            except Exception:
+                continue
+
+        return VerifyResult(
+            status=VerifyStatus.FAILED,
+            reason=(
+                f"browser_type mismatch: selector '{selector}' exists but does not contain expected text"
+            ),
+            should_trigger_vision=True,
+        )
+
+    def _verify_browser_wait_for(self, params: dict, result: str) -> VerifyResult:
+        selector = str(params.get("selector", "")).strip()
+        text = str(params.get("text", "")).strip()
+        page = self._get_browser_page()
+        if not page:
+            return VerifyResult(
+                status=VerifyStatus.FAILED,
+                reason="browser_wait_for could not confirm active browser page",
+                should_trigger_vision=True,
+            )
+
+        if selector:
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+                if count > 0:
+                    return VerifyResult(
+                        status=VerifyStatus.PASSED,
+                        reason=f"browser_wait_for confirmed selector '{selector}' present",
+                    )
+                return VerifyResult(
+                    status=VerifyStatus.FAILED,
+                    reason=f"browser_wait_for selector '{selector}' not present",
+                    should_trigger_vision=True,
+                )
+            except Exception as e:
+                return VerifyResult(
+                    status=VerifyStatus.FAILED,
+                    reason=f"browser_wait_for selector check failed: {e}",
+                    should_trigger_vision=True,
+                )
+
+        if text:
+            try:
+                count = page.get_by_text(text, exact=False).count()
+                if count > 0:
+                    return VerifyResult(
+                        status=VerifyStatus.PASSED,
+                        reason=f"browser_wait_for confirmed text '{text}' present",
+                    )
+                return VerifyResult(
+                    status=VerifyStatus.FAILED,
+                    reason=f"browser_wait_for text '{text}' not present",
+                    should_trigger_vision=True,
+                )
+            except Exception as e:
+                return VerifyResult(
+                    status=VerifyStatus.FAILED,
+                    reason=f"browser_wait_for text check failed: {e}",
+                    should_trigger_vision=True,
+                )
+
+        # No explicit selector/text in params: rely on action result signal.
+        if "appeared" in (result or "").lower() or "present" in (result or "").lower():
+            return VerifyResult(
+                status=VerifyStatus.PASSED,
+                reason="browser_wait_for reported readiness",
+            )
+
+        return VerifyResult(
+            status=VerifyStatus.SKIPPED,
+            reason="browser_wait_for had no selector/text to validate",
+        )
 
     def _verify_switch_to_app(self, state: AgentState, params: dict, result: str) -> VerifyResult:
         """

@@ -24,6 +24,7 @@ import subprocess
 import atexit
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger("mira.browser")
 
@@ -32,7 +33,10 @@ logger = logging.getLogger("mira.browser")
 # ──────────────────────────────────────────
 CDP_PORT = 9222
 STARTUP_TIMEOUT = 15  # seconds to wait for browser to start in debug mode
+CONNECT_RETRIES = 3
 SETUP_FLAG_FILE = Path(__file__).parent.parent / ".playwright_setup_done"
+ACTION_SETTLE_MS = 120
+TYPE_DELAY_MS = 18
 
 # Known browser paths on Windows (checked in order)
 BROWSER_PATHS = {
@@ -152,6 +156,7 @@ def _launch_browser_debug_mode(browser_name: str = "Brave Browser") -> bool:
         f"--remote-debugging-port={CDP_PORT}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
     ]
 
     # Use the real user profile if it exists (preserves all sessions)
@@ -204,6 +209,7 @@ class BrowserController:
         self._browser = None
         self._context = None
         self._connected = False
+        self._agent_page = None
         self._browser_name = "Brave Browser"
 
         # Load browser preference from config
@@ -240,28 +246,54 @@ class BrowserController:
         # Step 2: Launch browser in debug mode (if not already running)
         console.print(f"[dim cyan]🌐 Ensuring {self._browser_name} is running in debug mode (port {CDP_PORT})...[/dim cyan]")
         if not _launch_browser_debug_mode(self._browser_name):
-            console.print(f"[bold red]✗ Failed to launch {self._browser_name} in debug mode.[/bold red]")
-            return False
+            # Startup can be racy on systems where an existing browser takes time
+            # to expose CDP. Give a short grace period before hard failing.
+            for _ in range(20):
+                if _is_port_open(CDP_PORT):
+                    break
+                time.sleep(0.5)
+
+            if not _is_port_open(CDP_PORT):
+                console.print(f"[bold red]✗ Failed to launch {self._browser_name} in debug mode.[/bold red]")
+                return False
 
         # Step 3: Connect Playwright via CDP
+        last_error = None
+        for attempt in range(1, CONNECT_RETRIES + 1):
+            try:
+                from playwright.sync_api import sync_playwright
+
+                if self._playwright is None:
+                    self._playwright = sync_playwright().start()
+
+                self._browser = self._playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+                self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
+                self._connected = True
+                self._agent_page = None
+
+                console.print(f"[bold green]✓ Connected to {self._browser_name} via CDP (port {CDP_PORT})[/bold green]")
+                logger.info(f"Playwright connected to browser via CDP on port {CDP_PORT}")
+                return True
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Playwright CDP connection attempt %s/%s failed: %s",
+                    attempt,
+                    CONNECT_RETRIES,
+                    e,
+                )
+                time.sleep(0.6)
+
+        logger.error(f"Playwright CDP connection failed after retries: {last_error}")
+        console.print(f"[bold red]✗ CDP connection failed:[/bold red] {str(last_error)[:200]}")
+        self._connected = False
+        return False
+
+    def _is_page_usable(self, page) -> bool:
         try:
-            from playwright.sync_api import sync_playwright
-
-            if self._playwright is None:
-                self._playwright = sync_playwright().start()
-
-            self._browser = self._playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-            self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
-            self._connected = True
-
-            console.print(f"[bold green]✓ Connected to {self._browser_name} via CDP (port {CDP_PORT})[/bold green]")
-            logger.info(f"Playwright connected to browser via CDP on port {CDP_PORT}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Playwright CDP connection failed: {e}")
-            console.print(f"[bold red]✗ CDP connection failed:[/bold red] {str(e)[:200]}")
-            self._connected = False
+            return page is not None and not page.is_closed()
+        except Exception:
             return False
 
     def get_active_page(self):
@@ -269,13 +301,36 @@ class BrowserController:
         if not self.ensure_connected():
             return None
 
+        # Prefer a sticky "agent-controlled" tab to avoid drifting across tabs.
+        if self._is_page_usable(self._agent_page):
+            return self._agent_page
+
         pages = self._context.pages
         if not pages:
             # No tabs open — create one
-            return self._context.new_page()
+            self._agent_page = self._context.new_page()
+            return self._agent_page
+
+        # Prefer visible tabs (prevents acting on hidden/background startup tabs).
+        for page in reversed(pages):
+            try:
+                visibility = page.evaluate("() => document.visibilityState")
+                if visibility == "visible":
+                    self._agent_page = page
+                    return page
+            except Exception:
+                continue
 
         # Return the last page (most recently active)
-        return pages[-1]
+        self._agent_page = pages[-1]
+        return self._agent_page
+
+    def set_agent_page(self, page):
+        if page is None:
+            self._agent_page = None
+            return
+        if self._is_page_usable(page):
+            self._agent_page = page
 
     def get_all_pages(self) -> list:
         """Get all open pages/tabs."""
@@ -297,6 +352,7 @@ class BrowserController:
             self._context = None
             self._playwright = None
             self._connected = False
+            self._agent_page = None
             BrowserController._instance = None
 
 
@@ -313,6 +369,119 @@ atexit.register(_cleanup)
 # ──────────────────────────────────────────
 # These are the functions that brain.py exposes as agent tools.
 
+def _stabilize_page(page, wait_for_load: bool = True):
+    """Best-effort tab stabilization to reduce startup focus glitches."""
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    if wait_for_load:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+
+    try:
+        focus_info = page.evaluate(
+            """() => ({
+                hasFocus: typeof document.hasFocus === 'function' ? document.hasFocus() : true,
+                visibility: document.visibilityState || 'visible'
+            })"""
+        )
+    except Exception:
+        focus_info = {}
+
+    if isinstance(focus_info, dict) and not focus_info.get("hasFocus", True):
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(ACTION_SETTLE_MS)
+        except Exception:
+            pass
+
+
+def _target_contains_text(target, expected_text: str) -> bool:
+    """Verify typed content actually landed in the target element."""
+    probe = (expected_text or "").strip().lower()
+    if not probe:
+        return True
+
+    # Keep comparisons cheap and robust for long messages.
+    probe = probe[:120]
+
+    try:
+        current = target.input_value(timeout=500) or ""
+        if probe in current.lower():
+            return True
+    except Exception:
+        pass
+
+    try:
+        current = target.evaluate(
+            """(el) => {
+                if (!el) return "";
+                if (typeof el.value === "string") return el.value;
+                return typeof el.textContent === "string" ? el.textContent : "";
+            }"""
+        ) or ""
+        if probe in current.lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _normalize_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    return candidate
+
+
+def _clean_host(host: str) -> str:
+    host = (host or "").lower().strip()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _url_matches_expected(actual_url: str, expected_url: str) -> bool:
+    expected_norm = _normalize_url(expected_url)
+    if not expected_norm:
+        return True
+
+    try:
+        actual = urlparse(actual_url)
+        expected = urlparse(expected_norm)
+    except Exception:
+        return False
+
+    actual_host = _clean_host(actual.hostname or "")
+    expected_host = _clean_host(expected.hostname or "")
+    if expected_host:
+        if actual_host != expected_host and not actual_host.endswith(f".{expected_host}"):
+            return False
+
+    expected_path = (expected.path or "").rstrip("/")
+    actual_path = (actual.path or "").rstrip("/")
+    if expected_path and expected_path != "/":
+        if not actual_path.startswith(expected_path):
+            return False
+
+    return True
+
+
+def _is_page_visible(page) -> bool:
+    try:
+        visibility = page.evaluate("() => document.visibilityState || 'visible'")
+        return visibility == "visible"
+    except Exception:
+        return True
+
 def browser_navigate(url: str) -> str:
     """Navigate the active tab to a URL. Waits for the page to load."""
     try:
@@ -321,13 +490,29 @@ def browser_navigate(url: str) -> str:
         if not page:
             return "ERROR: Cannot connect to browser."
 
+        _stabilize_page(page, wait_for_load=False)
+
         # Normalize URL
-        if not url.startswith(("http://", "https://")):
-            url = f"https://{url}"
+        url = _normalize_url(url)
+        if not url:
+            return "Navigation failed: URL is empty."
 
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        _stabilize_page(page, wait_for_load=True)
+        controller.set_agent_page(page)
         title = page.title()
         final_url = page.url
+
+        if not _url_matches_expected(final_url, url):
+            return (
+                f"Navigation verification failed: requested '{url}' but active tab is '{final_url}'"
+            )
+
+        if not _is_page_visible(page):
+            return (
+                f"Navigation verification failed: tab loaded at '{final_url}' but is not visible"
+            )
+
         logger.info(f"Navigated to: {final_url} (title: {title})")
         return f"Navigated to '{title}' ({final_url})"
 
@@ -441,7 +626,9 @@ def browser_click(selector: str) -> str:
         if not selector:
             return "Click failed: selector is empty."
 
-        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        _stabilize_page(page, wait_for_load=True)
+        if not _is_page_visible(page):
+            return "Click failed: active browser tab is not visible."
 
         # Pass 1: CSS locator strategy.
         last_error = None
@@ -514,7 +701,7 @@ def _build_type_locators(page, selector: str) -> list[tuple[str, object]]:
     return candidates
 
 
-def _type_into_candidates(candidates: list[tuple[str, object]], text: str, clear_first: bool) -> tuple[str, int]:
+def _type_into_candidates(page, candidates: list[tuple[str, object]], text: str, clear_first: bool) -> tuple[str, int]:
     """
     Try typing into candidate locators and return the winning strategy.
     """
@@ -534,11 +721,69 @@ def _type_into_candidates(candidates: list[tuple[str, object]], text: str, clear
             try:
                 target.wait_for(state="visible", timeout=1200)
                 target.scroll_into_view_if_needed(timeout=1200)
+                try:
+                    target.click(timeout=1200)
+                except Exception:
+                    pass
+                try:
+                    target.focus(timeout=1200)
+                except Exception:
+                    pass
+
+                typed = False
                 if clear_first:
-                    target.fill(text, timeout=5000)
-                else:
-                    target.type(text, timeout=5000)
-                return desc, i
+                    try:
+                        target.fill(text, timeout=5000)
+                        typed = True
+                    except Exception as fill_error:
+                        last_error = fill_error
+
+                if not typed:
+                    try:
+                        if clear_first:
+                            try:
+                                target.press("Control+A", timeout=1200)
+                            except Exception:
+                                pass
+                        target.type(text, timeout=7000, delay=TYPE_DELAY_MS)
+                        typed = True
+                    except Exception as type_error:
+                        last_error = type_error
+
+                # Last-resort DOM assignment when key events are flaky on startup.
+                if not typed:
+                    try:
+                        dom_assigned = target.evaluate(
+                            """(el, value) => {
+                                if (!el) return false;
+                                const canSetValue = typeof el.value === "string";
+                                if (!canSetValue && !el.isContentEditable) return false;
+                                if (canSetValue) {
+                                    el.focus();
+                                    el.value = value;
+                                } else {
+                                    el.focus();
+                                    el.textContent = value;
+                                }
+                                el.dispatchEvent(new Event("input", { bubbles: true }));
+                                el.dispatchEvent(new Event("change", { bubbles: true }));
+                                return true;
+                            }""",
+                            text,
+                        )
+                        typed = bool(dom_assigned)
+                    except Exception as dom_error:
+                        last_error = dom_error
+
+                if typed and _target_contains_text(target, text):
+                    return desc, i
+
+                # Give React/Vue controlled inputs one more moment before re-checking.
+                page.wait_for_timeout(ACTION_SETTLE_MS)
+                if typed and _target_contains_text(target, text):
+                    return desc, i
+
+                last_error = RuntimeError(f"Input did not retain typed text for candidate {desc}[{i}]")
             except Exception as e:
                 last_error = e
                 continue
@@ -607,13 +852,16 @@ def browser_type(selector: str, text: str, clear_first: bool = True) -> str:
             return "ERROR: Cannot connect to browser."
 
         selector = (selector or "").strip() or "input"
-        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        _stabilize_page(page, wait_for_load=True)
+        if not _is_page_visible(page):
+            return "Type failed: active browser tab is not visible."
 
         # First pass: use normal locator strategy.
         first_pass_error = None
         try:
-            used_desc, used_index = _type_into_candidates(_build_type_locators(page, selector), text, clear_first)
+            used_desc, used_index = _type_into_candidates(page, _build_type_locators(page, selector), text, clear_first)
             logger.info(f"browser_type succeeded with {used_desc}[{used_index}]")
+            controller.set_agent_page(page)
             return f"Typed '{text[:50]}...' into {selector}" if len(text) > 50 else f"Typed '{text}' into {selector}"
         except Exception as e:
             first_pass_error = e
@@ -622,8 +870,9 @@ def browser_type(selector: str, text: str, clear_first: bool = True) -> str:
         revealed = _reveal_youtube_music_search_if_needed(page, selector)
         if revealed:
             try:
-                used_desc, used_index = _type_into_candidates(_build_type_locators(page, selector), text, clear_first)
+                used_desc, used_index = _type_into_candidates(page, _build_type_locators(page, selector), text, clear_first)
                 logger.info(f"browser_type succeeded after search reveal with {used_desc}[{used_index}]")
+                controller.set_agent_page(page)
                 return f"Typed '{text[:50]}...' into {selector}" if len(text) > 50 else f"Typed '{text}' into {selector}"
             except Exception as e:
                 first_pass_error = e
@@ -650,6 +899,7 @@ def browser_press_key(key: str) -> str:
         if not page:
             return "ERROR: Cannot connect to browser."
 
+        _stabilize_page(page, wait_for_load=False)
         page.keyboard.press(key)
         return f"Pressed key: {key}"
 
@@ -722,10 +972,14 @@ def browser_new_tab(url: str = "") -> str:
             return "ERROR: Cannot connect to browser."
 
         page = controller._context.new_page()
+        controller.set_agent_page(page)
         if url:
-            if not url.startswith(("http://", "https://")):
-                url = f"https://{url}"
+            url = _normalize_url(url)
+            if not url:
+                return "Failed to open new tab: URL is empty."
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if not _url_matches_expected(page.url, url):
+                return f"Failed to open requested URL in new tab. Active URL: {page.url}"
             return f"Opened new tab: {page.title()} ({page.url})"
         return "Opened new blank tab."
 
@@ -744,6 +998,7 @@ def browser_close_tab() -> str:
 
         title = page.title()
         page.close()
+        controller.set_agent_page(None)
         return f"Closed tab: {title}"
 
     except Exception as e:
@@ -758,6 +1013,8 @@ def browser_wait_for(selector: str = "", text: str = "", timeout: int = 10) -> s
         page = controller.get_active_page()
         if not page:
             return "ERROR: Cannot connect to browser."
+
+        _stabilize_page(page, wait_for_load=True)
 
         timeout_ms = timeout * 1000
 
@@ -846,6 +1103,8 @@ def browser_scroll(direction: str = "down", amount: int = 3) -> str:
         page = controller.get_active_page()
         if not page:
             return "ERROR: Cannot connect to browser."
+
+        _stabilize_page(page, wait_for_load=False)
 
         pixels = amount * 300  # ~300px per "scroll tick"
         if direction == "up":

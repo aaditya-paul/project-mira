@@ -607,6 +607,57 @@ class AgentBrain:
 
         return client.chat.completions.create(**args)
 
+    def _is_multi_intent_task(self, task_prompt: str) -> bool:
+        """
+        Detect whether a task asks for more than a simple open/switch/navigation action.
+        """
+        task = f" {(task_prompt or '').lower().strip()} "
+        if not task.strip():
+            return False
+
+        secondary_intent_tokens = (
+            " send ", " message ", " dm ", " text ", " chat ",
+            " play ", " search ", " find ", " watch ", " listen ",
+            " call ", " post ", " upload ", " download ", " reply ",
+            " book ", " order ", " buy ", " stream ", " email "
+        )
+        connectors = (" and ", " then ", " to ")
+
+        has_secondary_intent = any(token in task for token in secondary_intent_tokens)
+        has_connector = any(token in task for token in connectors)
+        token_count = len(task_prompt.split()) if task_prompt else 0
+
+        # Keep simple tasks like "open gmail" on generic playbooks.
+        return has_secondary_intent and (has_connector or token_count > 4)
+
+    def _should_force_playbook_creation(self, task_prompt: str, playbook_name: str) -> bool:
+        """
+        If a generic playbook matched a multi-intent request, force creation of
+        a specialized playbook so the engine does not stop at an underfit plan.
+        """
+        if playbook_name not in {"open_app", "open_url"}:
+            return False
+
+        if not self._is_multi_intent_task(task_prompt):
+            return False
+
+        logger.info(
+            "Generic playbook '%s' matched a multi-intent task. Forcing playbook creation.",
+            playbook_name,
+        )
+        return True
+
+    def _is_web_browser_task(self, task_prompt: str) -> bool:
+        """Heuristic to detect tasks that should use browser_* actions."""
+        task = (task_prompt or "").lower()
+        web_markers = (
+            "http://", "https://", ".com", ".org", ".net",
+            "browser", "website", "web", "url",
+            "instagram", "reddit", "twitter", " x ", "linkedin", "facebook",
+            "youtube", "gmail", "duckduckgo"
+        )
+        return any(marker in task for marker in web_markers)
+
     def _generate_plan(self, task_prompt: str, context_snapshot: str) -> list[dict]:
         """
         Phase 1: Generate a step-by-step plan.
@@ -623,6 +674,8 @@ class AgentBrain:
         """
         
         # ── Try 1: Playbook matching ──
+        force_create_playbook = False
+
         if self.playbook_engine.playbooks:
             console.print("  [dim cyan]Checking playbooks...[/dim cyan]")
             pb_name, pb_vars = self.playbook_engine.match_playbook(
@@ -631,17 +684,27 @@ class AgentBrain:
             )
             
             if pb_name:
-                plan = self.playbook_engine.render_playbook(pb_name, pb_vars)
-                if plan:
-                    console.print(f"  [bold green]📖 Using playbook: {pb_name}[/bold green] [dim](variables: {pb_vars})[/dim]")
-                    return plan
+                if self._should_force_playbook_creation(task_prompt, pb_name):
+                    force_create_playbook = True
+                    console.print(
+                        "  [dim yellow]Generic playbook matched, but task needs a richer workflow. "
+                        "Creating a specialized playbook...[/dim yellow]"
+                    )
                 else:
-                    console.print(f"  [dim yellow]Playbook '{pb_name}' matched but rendered empty. Falling back.[/dim yellow]")
+                    plan = self.playbook_engine.render_playbook(pb_name, pb_vars)
+                    if plan:
+                        console.print(f"  [bold green]📖 Using playbook: {pb_name}[/bold green] [dim](variables: {pb_vars})[/dim]")
+                        return plan
+                    else:
+                        console.print(f"  [dim yellow]Playbook '{pb_name}' matched but rendered empty. Falling back.[/dim yellow]")
             else:
                 console.print("  [dim yellow]No playbook matched.[/dim yellow]")
         
         # ── Try 2: Auto-create a new playbook ──
-        console.print("  [bold magenta]🧠 Creating new playbook for this task...[/bold magenta]")
+        if force_create_playbook:
+            console.print("  [bold magenta]🧠 Creating specialized playbook for this task...[/bold magenta]")
+        else:
+            console.print("  [bold magenta]🧠 Creating new playbook for this task...[/bold magenta]")
         new_pb_name = self.playbook_architect.create_playbook(
             task_prompt, context_snapshot,
             self.clients, self.providers, self.fallback_chain
@@ -679,7 +742,8 @@ class AgentBrain:
 
     def _generate_plan_dynamic(self, task_prompt: str, context_snapshot: str) -> list[dict]:
         """Fallback: Generate a plan dynamically via LLM when no playbook matches."""
-        
+        is_web_task = self._is_web_browser_task(task_prompt)
+
         planning_prompt = f"""{context_snapshot}
 
 USER TASK: {task_prompt}
@@ -691,6 +755,12 @@ AVAILABLE ACTIONS:
 - type_keyboard(text, hotkey): Type text OR press keyboard shortcut
 - click_mouse(x, y, button): Click at screen coordinates
 - scroll_mouse(clicks): Scroll up/down
+    - browser_navigate(url): Navigate directly using Playwright CDP (preferred for all web tasks)
+    - browser_click(selector): Click by selector/text in browser DOM
+    - browser_type(selector, text, clear_first): Type into browser inputs
+    - browser_press_key(key): Press key in browser context
+    - browser_wait_for(selector, text, timeout): Wait for DOM element/text in browser
+    - browser_scroll(direction, amount): Scroll the browser page
 
 CRITICAL KEYBOARD SHORTCUTS (memorize these — getting them wrong breaks everything):
   ctrl+l = FOCUS ADDRESS BAR in browsers. Use this to type a URL.
@@ -709,13 +779,15 @@ RULES:
    - Search: DuckDuckGo (duckduckgo.com in browser)
 4. When composing messages: write a proper, natural message. Don't copy raw task text.
 5. NEVER use placeholders like "username" or "user@example.com". If you don't know a specific value, skip that step.
-6. To navigate to a URL in a browser: switch_to_app → ctrl+l → type URL → enter
-7. To search in WhatsApp: switch_to_app → ctrl+f → type name → enter
+6. For ALL web/social/media tasks, prefer browser_* actions over keyboard/mouse UI control.
+7. For web tasks, NEVER use click_mouse coordinates.
+8. For social DM tasks, prefer inbox/messages URL flows over homepage search.
+9. To search in WhatsApp desktop: switch_to_app → ctrl+f → type name → enter
 
 OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no code fences.
 [
-  {{"step": 1, "action": "switch_to_app", "params": {{"app_name": "Brave Browser"}}, "description": "Bring browser to foreground", "expect": "browser_foreground", "risk_level": "medium"}},
-  {{"step": 2, "action": "type_keyboard", "params": {{"hotkey": "ctrl,l"}}, "description": "Focus address bar", "expect": "address_bar_focused", "risk_level": "medium"}}
+    {{"step": 1, "action": "browser_navigate", "params": {{"url": "instagram.com/direct/inbox/"}}, "description": "Open Instagram inbox", "expect": "messages_open", "risk_level": "low"}},
+    {{"step": 2, "action": "browser_type", "params": {{"selector": "input[aria-label*='Search' i]", "text": "rajdeep"}}, "description": "Search recipient", "expect": "recipient_typed", "risk_level": "low"}}
 ]"""
 
         for provider in self.fallback_chain:
@@ -742,8 +814,29 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
                 plan_text = plan_text.strip()
                 
                 plan = json.loads(plan_text)
+
+                if not isinstance(plan, list):
+                    raise ValueError("Dynamic planner did not return a JSON array")
                 
                 plan = [s for s in plan if s.get("action") != "vision"]
+
+                if is_web_task:
+                    has_browser_actions = any(str(s.get("action", "")).startswith("browser_") for s in plan)
+                    has_coordinate_actions = any(s.get("action") in {"click_mouse", "move_mouse"} for s in plan)
+
+                    if not has_browser_actions:
+                        logger.warning(
+                            "Rejected dynamic plan from %s for web task: no browser_* actions.",
+                            provider,
+                        )
+                        continue
+                    if has_coordinate_actions:
+                        logger.warning(
+                            "Rejected dynamic plan from %s for web task: contains coordinate actions.",
+                            provider,
+                        )
+                        continue
+
                 for i, step in enumerate(plan):
                     step["step"] = i + 1
                     if "expect" not in step:
@@ -901,12 +994,19 @@ AVAILABLE ACTIONS:
 - switch_to_app(app_name): Bring an app to foreground
 - type_keyboard(text, hotkey): Type text or press keys
 - click_mouse(x, y, button): Click at coordinates (use ONLY if vision analysis provides coordinates)
+- browser_navigate(url): Navigate browser to URL with Playwright
+- browser_click(selector): Click browser DOM element by selector/text
+- browser_type(selector, text, clear_first): Type into browser input by selector
+- browser_press_key(key): Press a key in browser context
+- browser_wait_for(selector, text, timeout): Wait for browser DOM/text state
+- browser_get_state(): Return active browser tab URL/title for diagnosis
 
 RULES:
 1. Output ONLY a single JSON object — no markdown, no explanation
 2. If the wrong window is active, switch_to_app to the correct one
 3. If an element wasn't found, try an alternative approach (different hotkey, etc.)
-4. If you can't determine a fix, output: {{"action": "abort", "reason": "..."}}
+4. For browser verification failures, prefer browser_get_state or browser_navigate/browser_wait_for before desktop coordinates.
+5. If you can't determine a fix, output: {{"action": "abort", "reason": "..."}}
 
 Example outputs:
 {{"action": "switch_to_app", "params": {{"app_name": "WhatsApp"}}, "description": "Refocus WhatsApp"}}

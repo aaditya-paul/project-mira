@@ -1,0 +1,76 @@
+name: send_instagram_dm
+description: "Send an Instagram DM using inbox-first browser workflow"
+
+triggers:
+  - "open instagram and send a dm to {recipient}"
+  - "send dm to {recipient} on instagram"
+  - "dm {recipient} on instagram"
+  - "send message to {recipient} on instagram"
+  - "instagram dm {recipient}"
+  - "message {recipient} on instagram saying {message}"
+
+variables:
+  recipient:
+    description: "Instagram username/contact to DM"
+    required: true
+  message:
+    description: "Message text to send. If not explicitly provided, compose a short natural DM."
+    required: false
+    default: "Hey!"
+    compose: true
+
+steps:
+  - action: browser_navigate
+    params:
+      url: "instagram.com/direct/inbox/"
+    description: "Open Instagram Direct inbox via Playwright"
+    expect: "instagram_dm_open"
+    risk_level: "low"
+    notes: >
+      Inbox-first flow is more reliable than homepage search for DM tasks.
+
+  - action: browser_type
+    params:
+      selector: "input[aria-label*='Search' i], [role='searchbox'] input"
+      text: "{recipient}"
+    description: "Type recipient in DM search"
+    expect: "recipient_typed"
+    risk_level: "low"
+
+  - action: browser_wait_for
+    params:
+      selector: "a[href*='/direct/t/'], [role='listbox'] [role='option'], [role='grid'] [role='button']"
+      timeout: 12
+    description: "Wait for DM thread search results"
+    expect: "search_results_visible"
+    risk_level: "low"
+
+  - action: browser_press_key
+    params:
+      key: "Enter"
+    description: "Open top matching thread"
+    expect: "dm_page_loaded"
+    risk_level: "medium"
+
+  - action: browser_wait_for
+    params:
+      selector: "textarea[placeholder*='Message' i], div[contenteditable='true'][aria-label*='Message' i]"
+      timeout: 12
+    description: "Wait for message composer"
+    expect: "message_input_visible"
+    risk_level: "low"
+
+  - action: browser_type
+    params:
+      selector: "textarea[placeholder*='Message' i], div[contenteditable='true'][aria-label*='Message' i]"
+      text: "{message}"
+    description: "Type DM text"
+    expect: "message_typed"
+    risk_level: "low"
+
+  - action: browser_press_key
+    params:
+      key: "Enter"
+    description: "Send DM"
+    expect: "message_sent"
+    risk_level: "medium"
