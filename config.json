@@ -1,11 +1,15 @@
 {
+  "user_profile": {
+    "name": "Aaditya",
+    "default_browser": "Brave Browser"
+  },
   "fallback_chain": ["groq", "ollama", "gemini", "nvidia"],
   "show_thoughts": true,
   "vision_analyzer": {
-    "provider": "ollama",
-    "model": "gemma4:e2b",
-    "fallback": "gemini",
-    "fallback_model": "gemini-2.5-flash"
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "fallback": "ollama",
+    "fallback_model": "gemma4:e2b"
   },
   "providers": {
     "ollama": {

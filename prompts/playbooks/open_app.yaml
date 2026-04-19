@@ -1,0 +1,48 @@
+name: open_app
+description: "Open or switch to any application on the desktop"
+
+triggers:
+  - "open {app}"
+  - "launch {app}"
+  - "start {app}"
+  - "switch to {app}"
+  - "go to {app}"
+  - "bring up {app}"
+
+variables:
+  app:
+    description: "The application name to open or switch to"
+    required: true
+
+steps:
+  #
+  # STEP 1: Try to switch to the app directly
+  # ──────────────────────────────────────────
+  # If the app is already running, switch_to_app brings it to foreground instantly.
+  # If it's NOT running, the executor will automatically try to launch it.
+  #
+  - action: switch_to_app
+    params:
+      app_name: "{app}"
+    description: "Switch to {app} (or launch if not running)"
+    expect: "app_foreground"
+    risk_level: "medium"
+    notes: >
+      The executor handles the full lifecycle:
+        1. First tries switch_to_app (instant if app is running)
+        2. If NOT FOUND, tries launch_app which attempts:
+           a. Microsoft Store (AppX) launch
+           b. Start Menu shortcut launch
+           c. Direct Start-Process
+        3. Then polls for up to 10 seconds waiting for the window to appear
+      
+      COMMON APPS AND THEIR PROCESS NAMES:
+        - WhatsApp → whatsapp / whatsapp.root
+        - Brave Browser → brave
+        - Discord → discord
+        - Spotify → spotify
+        - VS Code → code
+        - Notepad → notepad
+        - File Explorer → explorer
+      
+      After this step, the app should be in the foreground and ready for interaction.

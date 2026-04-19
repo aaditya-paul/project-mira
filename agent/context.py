@@ -408,10 +408,10 @@ def build_context_snapshot() -> str:
             known_running.append(f"{display} ({title})")
             seen_names.add(proc)
     
-    # 4. Quick check of key messaging apps
-    messaging_apps = ["whatsapp", "telegram", "discord", "slack"]
+    # 4. Quick check of key apps
+    key_apps = ["whatsapp", "telegram", "discord", "slack", "brave"]
     app_status_lines = []
-    for app in messaging_apps:
+    for app in key_apps:
         info = APP_REGISTRY.get(app, {})
         exe_names = info.get("exe_names", [])
         # Check running via both process list AND visible windows

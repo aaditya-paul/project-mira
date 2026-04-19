@@ -259,17 +259,17 @@ def scroll_mouse(clicks: int) -> str:
     except Exception as e:
         return f"Failed to scroll: {str(e)}"
 
-def type_keyboard(text: str = "", hotkey: str = "") -> str:
+def type_keyboard(text: str = "", hotkey: str = "", repeat: int = 1) -> str:
     """Types text on the keyboard OR sends a hotkey combination.
     Provide 'text' to type a string. 
     Provide 'hotkey' to send a combo like 'ctrl,c' or 'enter' or 'win'. Provide comma separated keys.
-    Both can be provided: hotkey fires first, then text is typed.
+    'repeat' specifies how many times to perform the action (only for hotkeys).
     """
     try:
         result_log = []
         
-        # LLM Auto-correction: if text accidentally contains a standalone hotkey
-        common_hotkeys = {"win", "enter", "esc", "tab", "up", "down", "left", "right", "space", "backspace"}
+        # LLM/Playbook Auto-correction: if text accidentally contains a standalone hotkey
+        common_hotkeys = {"win", "enter", "esc", "tab", "up", "down", "left", "right", "space", "backspace", "/"}
         if text and str(text).lower().strip() in common_hotkeys and not hotkey:
             hotkey = text.lower().strip()
             text = ""
@@ -280,9 +280,15 @@ def type_keyboard(text: str = "", hotkey: str = "") -> str:
             
         if hotkey:
             keys = [k.strip() for k in hotkey.split(',')]
-            pyautogui.hotkey(*keys)
-            result_log.append(f"Pressed hotkey: {keys}")
-            # Small pause between hotkey and text so the system has time to react
+            for i in range(repeat):
+                pyautogui.hotkey(*keys)
+                if repeat > 1:
+                    time.sleep(0.1) # Small gap between repeats
+            
+            rep_str = f" x{repeat}" if repeat > 1 else ""
+            result_log.append(f"Pressed hotkey: {keys}{rep_str}")
+            
+            # Small pause after hotkey so the system has time to react
             if text:
                 time.sleep(0.4)
         
@@ -511,4 +517,44 @@ if (-not $launched) {{
     except Exception as e:
         return f"Failed to launch app: {str(e)}"
 
+
+def click_element(name: str, control_type: str = None) -> str:
+    """
+    Click a named UI element using accessibility-first approach.
+    
+    Fallback chain:
+    1. pywinauto (instant, no vision) — tries to find element by name
+    2. vision + analyze (slow, but works for any UI) — falls back to coordinates
+    
+    Args:
+        name: The element label/text to click (e.g., "Search", "Send")
+        control_type: Optional type filter (e.g., "Button", "Edit")
+        
+    Returns:
+        Status string describing what happened and how.
+    """
+    # Try 1: Accessibility (pywinauto)
+    try:
+        from agent.accessibility import get_ui_automation
+        uia = get_ui_automation()
+        if uia.available:
+            result = uia.click_element(name, control_type)
+            if "clicked" in result.lower() and "not found" not in result.lower():
+                logger.info(f"click_element('{name}') succeeded via accessibility")
+                return result
+            logger.info(f"Accessibility click failed for '{name}': {result}")
+    except Exception as e:
+        logger.warning(f"Accessibility click error for '{name}': {e}")
+    
+    # Try 2: Vision fallback — take screenshot, analyze, find coordinates
+    try:
+        console.print(f"  [dim yellow]Accessibility failed for '{name}', falling back to vision...[/dim yellow]")
+        img_str = vision()
+        analysis = analyze_screenshot(img_str)
+        
+        # The analysis contains "SUGGESTED INTERACTION ZONES" with coordinates
+        # Return the analysis so the caller (brain) can extract coordinates
+        return f"VISION_FALLBACK: Element '{name}' not found via accessibility. Vision analysis:\n{analysis}"
+    except Exception as e:
+        return f"Failed to click '{name}': accessibility unavailable, vision failed: {str(e)}"
 

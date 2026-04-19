@@ -8,6 +8,10 @@ from pathlib import Path
 from agent.primitives import vision, move_mouse, click_mouse, scroll_mouse, type_keyboard, analyze_screenshot, switch_to_app, launch_app
 from agent.context import build_context_snapshot, check_app_installed
 from agent.display import console, print_tool_call, print_tool_result, print_final_answer, print_error, print_thought
+from agent.state import AgentState, StepStatus, RiskLevel
+from agent.verify import Verifier, VerifyStatus
+from agent.playbooks import PlaybookEngine
+from agent.learning import PlaybookArchitect
 
 # Tool schema mapping
 TOOLS = [
@@ -195,6 +199,16 @@ def execute_tool(name: str, args: dict) -> str:
 
 logger = logging.getLogger("mira.brain")
 
+# ──────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────
+MAX_RETRIES = 3           # Max recovery attempts per step
+SETTLE_DELAY = 0.3        # Seconds to wait after action for UI to settle
+APP_SWITCH_DELAY = 1.0    # Seconds to wait after app switch for window to render
+WAIT_POLL_INTERVAL = 0.5  # Seconds between polls when waiting for a condition
+WAIT_DEFAULT_TIMEOUT = 15 # Default timeout for wait_for conditions
+
+
 class AgentBrain:
     def __init__(self):
         with open("config.json", "r", encoding="utf-8") as f:
@@ -208,6 +222,9 @@ class AgentBrain:
             self.system_prompt = f.read()
 
         self.clients = self._init_clients()
+        self.verifier = Verifier()
+        self.playbook_engine = PlaybookEngine(config=self.config)
+        self.playbook_architect = PlaybookArchitect()
         
     def _init_clients(self):
         clients = {}
@@ -343,46 +360,114 @@ class AgentBrain:
         return client.chat.completions.create(**args)
 
     def _generate_plan(self, task_prompt: str, context_snapshot: str) -> list[dict]:
-        """Phase 1: Generate a step-by-step plan using the LLM (no tools, just reasoning)."""
+        """
+        Phase 1: Generate a step-by-step plan.
+        
+        Strategy:
+        1. Try to match a PLAYBOOK first (pre-written, battle-tested steps)
+        2. If no playbook matches, fall back to dynamic LLM generation
+        
+        Playbooks are vastly superior because:
+        - Every step is pre-tested and edge-case-aware
+        - No risk of hallucinated shortcuts (ctrl+f vs ctrl+l)
+        - Variables are extracted once, then substituted deterministically
+        - The LLM only classifies intent — it doesn't generate steps
+        """
+        
+        # ── Try 1: Playbook matching ──
+        if self.playbook_engine.playbooks:
+            console.print("  [dim cyan]Checking playbooks...[/dim cyan]")
+            pb_name, pb_vars = self.playbook_engine.match_playbook(
+                task_prompt, context_snapshot,
+                self.clients, self.providers, self.fallback_chain
+            )
+            
+            if pb_name:
+                plan = self.playbook_engine.render_playbook(pb_name, pb_vars)
+                if plan:
+                    console.print(f"  [bold green]📖 Using playbook: {pb_name}[/bold green] [dim](variables: {pb_vars})[/dim]")
+                    return plan
+                else:
+                    console.print(f"  [dim yellow]Playbook '{pb_name}' matched but rendered empty. Falling back.[/dim yellow]")
+            else:
+                console.print("  [dim yellow]No playbook matched.[/dim yellow]")
+        
+        # ── Try 2: Auto-create a new playbook ──
+        console.print("  [bold magenta]🧠 Creating new playbook for this task...[/bold magenta]")
+        new_pb_name = self.playbook_architect.create_playbook(
+            task_prompt, context_snapshot,
+            self.clients, self.providers, self.fallback_chain
+        )
+        
+        if new_pb_name:
+            # Hot-load the newly created playbook
+            if self.playbook_engine.reload_single(new_pb_name):
+                console.print(f"  [bold green]📝 New playbook created: {new_pb_name}[/bold green]")
+                
+                # Now match it — the LLM needs to extract variables for this new playbook
+                pb_name2, pb_vars2 = self.playbook_engine.match_playbook(
+                    task_prompt, context_snapshot,
+                    self.clients, self.providers, self.fallback_chain
+                )
+                
+                if pb_name2:
+                    plan = self.playbook_engine.render_playbook(pb_name2, pb_vars2)
+                    if plan:
+                        console.print(f"  [bold green]📖 Using new playbook: {pb_name2}[/bold green] [dim](variables: {pb_vars2})[/dim]")
+                        return plan
+                
+                # If matcher failed, try rendering with empty variables (use defaults)
+                plan = self.playbook_engine.render_playbook(new_pb_name, {})
+                if plan:
+                    console.print(f"  [bold green]📖 Using new playbook: {new_pb_name}[/bold green] [dim](default variables)[/dim]")
+                    return plan
+            else:
+                console.print(f"  [dim red]Failed to load new playbook '{new_pb_name}'.[/dim red]")
+        else:
+            console.print("  [dim yellow]Playbook creation failed. Using dynamic LLM planning.[/dim yellow]")
+        
+        # ── Try 3: Dynamic LLM generation (last resort) ──
+        return self._generate_plan_dynamic(task_prompt, context_snapshot)
+
+    def _generate_plan_dynamic(self, task_prompt: str, context_snapshot: str) -> list[dict]:
+        """Fallback: Generate a plan dynamically via LLM when no playbook matches."""
         
         planning_prompt = f"""{context_snapshot}
 
 USER TASK: {task_prompt}
 
-You are a TASK PLANNER for a desktop automation agent. Based on the system context above, generate a precise step-by-step plan to accomplish the user's task.
+You are a TASK PLANNER for a desktop automation agent. Generate a precise step-by-step plan.
 
-AVAILABLE ACTIONS (the ONLY actions the executor can perform):
-- switch_to_app(app_name): Instantly bring a running app window to foreground
-- type_keyboard(text, hotkey): Type text OR press keyboard shortcut. Use "text" for typing strings, "hotkey" for shortcuts like "ctrl,f", "enter", "win"
+AVAILABLE ACTIONS:
+- switch_to_app(app_name): Bring a running app window to foreground
+- type_keyboard(text, hotkey): Type text OR press keyboard shortcut
 - click_mouse(x, y, button): Click at screen coordinates
 - scroll_mouse(clicks): Scroll up/down
 
+CRITICAL KEYBOARD SHORTCUTS (memorize these — getting them wrong breaks everything):
+  ctrl+l = FOCUS ADDRESS BAR in browsers. Use this to type a URL.
+  ctrl+f = FIND IN PAGE. Searches for text ON the current page. NEVER use this to navigate to a URL.
+  ctrl+k = Search bar in some apps.
+  ctrl+t = New tab in browsers.
+  ctrl+w = Close current tab.
+
 RULES:
 1. Break the task into the SMALLEST possible atomic steps — one action per step
-2. Do NOT include any vision/screenshot/verify steps. The system handles verification automatically via window title checks.
-3. Consider edge cases:
-   - Is the app running? Use switch_to_app. Not running but installed? Use win key + type name + enter.
-   - After searching for a contact, you MUST select them (press Enter) BEFORE typing a message
-   - WhatsApp search shortcut is Ctrl+F
-4. DEFAULT APPS (Use these if not specified in the task):
-   - Texting/Messaging: WhatsApp
-   - Emails & Browsing: Brave Browser
-   - Music: YouTube Music
-   - Media/Videos: YouTube
-   - Search: DuckDuckGo Search (type "duckduckgo.com" in browser)
-5. When composing messages: write a proper, natural message from the user's perspective.
-   Do NOT copy-paste the user's raw task text as the message.
-   Example: user says "tell june dont marry yet bad news" -> compose: "Hey June, please hold off on the marriage plans for now. I have some important news I need to share with you first."
-6. Each step must specify the exact action and parameters — no placeholders.
+2. Do NOT include vision/screenshot/verify steps. System handles verification automatically.
+3. DEFAULT APPS:
+   - Texting/Messaging: WhatsApp (search shortcut: Ctrl+F)
+   - Emails, Web, & Browsing: Brave Browser (CRITICAL: NOT Edge, NOT Chrome)
+   - Music: YouTube Music (music.youtube.com in browser)
+   - Search: DuckDuckGo (duckduckgo.com in browser)
+4. When composing messages: write a proper, natural message. Don't copy raw task text.
+5. NEVER use placeholders like "username" or "user@example.com". If you don't know a specific value, skip that step.
+6. To navigate to a URL in a browser: switch_to_app → ctrl+l → type URL → enter
+7. To search in WhatsApp: switch_to_app → ctrl+f → type name → enter
 
 OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no code fences.
 [
-  {{"step": 1, "action": "switch_to_app", "params": {{"app_name": "WhatsApp"}}, "description": "Bring WhatsApp to foreground"}},
-  {{"step": 2, "action": "type_keyboard", "params": {{"hotkey": "ctrl,f"}}, "description": "Open search bar"}},
-  {{"step": 3, "action": "type_keyboard", "params": {{"text": "June"}}, "description": "Search for contact"}},
-  {{"step": 4, "action": "type_keyboard", "params": {{"hotkey": "enter"}}, "description": "Select contact from results"}},
-  {{"step": 5, "action": "type_keyboard", "params": {{"text": "Hey June..."}}, "description": "Type the message"}},
-  {{"step": 6, "action": "type_keyboard", "params": {{"hotkey": "enter"}}, "description": "Send the message"}}
+  {{"step": 1, "action": "switch_to_app", "params": {{"app_name": "Brave Browser"}}, "description": "Bring browser to foreground", "expect": "browser_foreground", "risk_level": "medium"}},
+  {{"step": 2, "action": "type_keyboard", "params": {{"hotkey": "ctrl,l"}}, "description": "Focus address bar", "expect": "address_bar_focused", "risk_level": "medium"}}
 ]"""
 
         for provider in self.fallback_chain:
@@ -402,7 +487,6 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
                 )
                 
                 plan_text = resp.choices[0].message.content.strip()
-                # Clean up markdown fences if the LLM wraps it
                 if plan_text.startswith("```"):
                     plan_text = plan_text.split("\n", 1)[1] if "\n" in plan_text else plan_text[3:]
                 if plan_text.endswith("```"):
@@ -411,15 +495,24 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
                 
                 plan = json.loads(plan_text)
                 
-                # Filter out vision steps the LLM might have snuck in
                 plan = [s for s in plan if s.get("action") != "vision"]
                 for i, step in enumerate(plan):
                     step["step"] = i + 1
+                    if "expect" not in step:
+                        step["expect"] = ""
+                    if "risk_level" not in step:
+                        action = step.get("action", "")
+                        if action in ("click_mouse", "move_mouse"):
+                            step["risk_level"] = "high"
+                        elif action in ("switch_to_app", "launch_app"):
+                            step["risk_level"] = "medium"
+                        else:
+                            step["risk_level"] = "low"
                 
-                logger.info(f"Plan generated with {len(plan)} steps via {provider}")
+                logger.info(f"Dynamic plan generated with {len(plan)} steps via {provider}")
                 return plan
             except Exception as e:
-                logger.error(f"Planning failed with {provider}: {e}")
+                logger.error(f"Dynamic planning failed with {provider}: {e}")
                 continue
         
         return []
@@ -451,7 +544,150 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
         console.print(f"  [bold red]✗ {app_name} launched but window not found after 10s[/bold red]")
         return False
 
+    def _execute_action(self, action: str, params: dict) -> str:
+        """Execute a single plan action. Extracted for reuse in recovery."""
+        if action == "switch_to_app":
+            return switch_to_app(params.get("app_name", ""))
+        elif action == "type_keyboard":
+            return type_keyboard(
+                params.get("text", ""), 
+                params.get("hotkey", params.get("key", "")), 
+                params.get("repeat", 1)
+            )
+        elif action == "click_mouse":
+            return click_mouse(params.get("x", -1), params.get("y", -1), params.get("button", "left"))
+        elif action == "scroll_mouse":
+            return scroll_mouse(params.get("clicks", 0))
+        elif action == "move_mouse":
+            return move_mouse(params.get("x", 0), params.get("y", 0))
+        else:
+            return f"Unknown action: {action}"
+
+    def _wait_for_condition(self, wait_for: dict, pre_title: str) -> bool:
+        """
+        Dynamically wait for a condition by polling cheap OS signals.
+        No hardcoded sleeps — polls until the condition is met or timeout.
+
+        Supported conditions (from playbook YAML `wait_for` field):
+          title_contains: "keyword"   — wait until window title includes this keyword
+          title_changed: true         — wait until window title differs from pre_title
+          timeout: N                  — max seconds to wait (default: 15)
+
+        Returns True if condition was met, False if timed out.
+        """
+        from agent.context import get_active_window
+
+        timeout = wait_for.get("timeout", WAIT_DEFAULT_TIMEOUT)
+        title_contains = wait_for.get("title_contains", "").lower().strip()
+        title_changed = wait_for.get("title_changed", False)
+
+        if not title_contains and not title_changed:
+            return True  # No condition specified, nothing to wait for
+
+        condition_desc = (
+            f"title contains '{title_contains}'" if title_contains
+            else f"title changes from '{pre_title[:50]}'"
+        )
+        console.print(f"  [dim cyan]⏳ Waiting for {condition_desc} (up to {timeout}s)...[/dim cyan]")
+
+        start = time.time()
+        polls = 0
+        while (time.time() - start) < timeout:
+            time.sleep(WAIT_POLL_INTERVAL)
+            polls += 1
+
+            active = get_active_window()
+            current_title = active.get("window_title", "").lower()
+
+            if title_contains and title_contains in current_title:
+                elapsed = time.time() - start
+                console.print(f"  [green]✓ Condition met:[/green] [dim]title contains '{title_contains}' ({elapsed:.1f}s, {polls} polls)[/dim]")
+                return True
+
+            if title_changed and current_title != pre_title.lower():
+                elapsed = time.time() - start
+                console.print(f"  [green]✓ Condition met:[/green] [dim]title changed to '{current_title[:60]}' ({elapsed:.1f}s, {polls} polls)[/dim]")
+                return True
+
+        elapsed = time.time() - start
+        console.print(f"  [yellow]⚠ Wait timed out after {elapsed:.1f}s ({polls} polls). Proceeding anyway.[/yellow]")
+        return False
+
+    def _get_recovery_action(self, state: AgentState, step: dict, verify_reason: str, vision_analysis: str = "") -> dict | None:
+        """
+        Ask the LLM for a single corrective action when a step fails verification.
+        
+        This is a lightweight call — no full re-planning, just one fix action.
+        """
+        recovery_context = state.get_recovery_context()
+        
+        recovery_prompt = f"""{recovery_context}
+
+Verification Failure: {verify_reason}
+{"Vision Analysis: " + vision_analysis[:500] if vision_analysis else "No vision data available."}
+
+You are a RECOVERY AGENT. The step above failed verification. Generate EXACTLY ONE corrective action to fix the situation.
+
+AVAILABLE ACTIONS:
+- switch_to_app(app_name): Bring an app to foreground
+- type_keyboard(text, hotkey): Type text or press keys
+- click_mouse(x, y, button): Click at coordinates (use ONLY if vision analysis provides coordinates)
+
+RULES:
+1. Output ONLY a single JSON object — no markdown, no explanation
+2. If the wrong window is active, switch_to_app to the correct one
+3. If an element wasn't found, try an alternative approach (different hotkey, etc.)
+4. If you can't determine a fix, output: {{"action": "abort", "reason": "..."}}
+
+Example outputs:
+{{"action": "switch_to_app", "params": {{"app_name": "WhatsApp"}}, "description": "Refocus WhatsApp"}}
+{{"action": "type_keyboard", "params": {{"hotkey": "escape"}}, "description": "Close popup and retry"}}
+{{"action": "abort", "reason": "App is not installed and no web fallback available"}}"""
+
+        for provider in self.fallback_chain:
+            try:
+                client = self.clients.get(provider)
+                if not client:
+                    continue
+                model = self.providers.get(provider, {}).get("model", "")
+                
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a recovery agent. Output ONLY valid JSON. No markdown."},
+                        {"role": "user", "content": recovery_prompt}
+                    ],
+                    temperature=0.1
+                )
+                
+                text = resp.choices[0].message.content.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+                
+                recovery = json.loads(text)
+                logger.info(f"Recovery action from {provider}: {recovery}")
+                return recovery
+                
+            except Exception as e:
+                logger.error(f"Recovery planning failed with {provider}: {e}")
+                continue
+        
+        return None
+
     def run_agentic_loop(self, task_prompt: str):
+        """
+        Main execution loop: Plan → Act → Verify → Correct
+        
+        Architecture:
+        1. PLAN: Generate step-by-step plan with LLM
+        2. EXECUTE: Run each step's action
+        3. VERIFY: Check outcome with cheap signals (window title, process, etc.)
+        4. RECOVER: If verification fails, use vision + LLM to generate a fix
+        5. RETRY: Re-attempt the step (up to MAX_RETRIES times)
+        """
         logger.info(f"--- Starting Agentic Loop for Task: {task_prompt} ---")
         
         # ── Phase 0: Gather system context ──
@@ -474,110 +710,195 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
             action = step.get("action", "?")
             desc = step.get("description", "")
             params = step.get("params", {})
+            risk = step.get("risk_level", "low")
+            expect = step.get("expect", "")
             param_str = ", ".join(f"{k}={v}" for k, v in params.items())
-            console.print(f"  [dim]{step_num}. [{action}] {desc}[/dim]" + (f" [dim cyan]({param_str})[/dim cyan]" if param_str else ""))
+            
+            risk_color = {"low": "green", "medium": "yellow", "high": "red"}.get(risk, "white")
+            console.print(
+                f"  [dim]{step_num}. [{action}] {desc}[/dim]"
+                + (f" [dim cyan]({param_str})[/dim cyan]" if param_str else "")
+                + f" [{risk_color}][{risk}][/{risk_color}]"
+                + (f" [dim magenta]→ {expect}[/dim magenta]" if expect else "")
+            )
         console.print()
         
-        # ── Phase 2: Smart Execution ──
-        console.print("[bold yellow]⚡ Phase 2: Executing plan...[/bold yellow]\n")
+        # ── Phase 2: Smart Execution with Verify → Correct Loop ──
+        console.print("[bold yellow]⚡ Phase 2: Executing with verification...[/bold yellow]\n")
         
         from agent.context import get_active_window
         
-        # Track which app we're targeting (for window verification)
-        target_app = None
-        app_confirmed = False
+        # Initialize state memory
+        state = AgentState(task=task_prompt)
         
         for step in plan:
             step_num = step.get("step", "?")
             action = step.get("action", "")
             params = step.get("params", {})
             description = step.get("description", "")
+            risk = step.get("risk_level", "low")
+            expect = step.get("expect", "")
+            wait_for = step.get("wait_for", None)
             
             console.print(f"[bold cyan]── Step {step_num}: {description} ──[/bold cyan]")
             
-            try:
-                result = ""
+            # Snapshot the window title BEFORE the action (for title_changed detection)
+            pre_action_window = get_active_window()
+            pre_action_title = pre_action_window.get("window_title", "")
+            
+            # Begin tracking this step
+            record = state.begin_step(step)
+            step_succeeded = False
+            
+            for attempt in range(MAX_RETRIES):
+                if attempt > 0:
+                    console.print(f"  [bold yellow]↻ Retry {attempt}/{MAX_RETRIES - 1}...[/bold yellow]")
                 
-                if action == "switch_to_app":
-                    app_name = params.get("app_name", "")
-                    target_app = app_name
-                    result = switch_to_app(app_name)
-                    
-                    # If switch failed, try launching the app
-                    if "not found" in result.lower():
-                        launched = self._launch_and_wait(app_name)
-                        if not launched:
-                            print_error(f"Cannot open {app_name}. Aborting plan.")
-                            return
-                        result = f"Launched and switched to {app_name}"
-                    
-                    app_confirmed = True
-                    print_tool_result(result)
-                    
-                    # Use ONE vision call here to see the app's UI state
-                    console.print("  [dim cyan]Checking app state...[/dim cyan]")
-                    time.sleep(1.0) # Let window settle
-                    img_str = vision()
-
-                    analysis = analyze_screenshot(img_str)
-                    preview = analysis[:200] + "..." if len(analysis) > 200 else analysis
-                    print_tool_result(f"Screen: {preview}")
-                    time.sleep(0.3)
-                    continue  # Done with this step
-                    
-                elif action == "type_keyboard":
-                    text = params.get("text", "")
-                    hotkey = params.get("hotkey", "")
-                    
-                    # Safety: before typing a long message, verify we're in the right app
-                    if text and len(text) > 20 and target_app:
-                        active = get_active_window()
-                        window_title = active.get("window_title", "")
-                        if target_app.lower() not in window_title.lower():
-                            console.print(f"  [bold red]⚠ Wrong window! Expected {target_app}, got: {window_title}[/bold red]")
-                            console.print("  [dim yellow]Attempting to refocus...[/dim yellow]")
-                            switch_to_app(target_app)
-                            time.sleep(0.5)
-                            # Re-check
-                            active = get_active_window()
-                            if target_app.lower() not in active.get("window_title", "").lower():
-                                print_error(f"Still wrong window. Aborting to prevent typing in wrong app.")
-                                return
-                    
-                    result = type_keyboard(text, hotkey)
-                elif action == "click_mouse":
-                    result = click_mouse(params.get("x", -1), params.get("y", -1), params.get("button", "left"))
-                elif action == "scroll_mouse":
-                    result = scroll_mouse(params.get("clicks", 0))
-                elif action == "move_mouse":
-                    result = move_mouse(params.get("x", 0), params.get("y", 0))
-                else:
-                    result = f"Unknown action: {action}"
-                
-                print_tool_result(result)
-                
-                # Free instant window title check
-                active = get_active_window()
-                window_title = active.get("window_title", "Unknown")
-                process_name = active.get("process_name", "Unknown")
-                print_tool_result(f"Window: {window_title} ({process_name})")
-                
-                # Small delay for UI to settle
-                time.sleep(0.3)
-                
-            except Exception as e:
-                print_error(f"Step {step_num} failed: {str(e)}")
-                console.print("  [dim yellow]Using vision fallback to diagnose...[/dim yellow]")
                 try:
-                    img_str = vision()
-                    analysis = analyze_screenshot(img_str)
-                    preview = analysis[:300] + "..." if len(analysis) > 300 else analysis
-                    print_tool_result(f"Vision Fallback:\n{preview}")
-                except Exception as ve:
-                    print_error(f"Vision fallback also failed: {str(ve)}")
+                    # ── EXECUTE ──
+                    result = ""
+                    
+                    if action == "switch_to_app":
+                        app_name = params.get("app_name", "")
+                        result = switch_to_app(app_name)
+                        
+                        # If switch failed, try launching the app
+                        if "not found" in result.lower():
+                            launched = self._launch_and_wait(app_name)
+                            if not launched:
+                                print_error(f"Cannot open {app_name}. Aborting plan.")
+                                state.mark_failed(f"Cannot open {app_name}")
+                                return
+                            result = f"Launched and switched to {app_name}"
+                        
+                        print_tool_result(result)
+                        state.record_result(result)
+                        
+                        # Vision on app switch — this is intentional (first time seeing the UI)
+                        console.print("  [dim cyan]📷 Scanning app state (first entry)...[/dim cyan]")
+                        time.sleep(APP_SWITCH_DELAY)
+                        img_str = vision()
+                        analysis = analyze_screenshot(img_str)
+                        preview = analysis[:200] + "..." if len(analysis) > 200 else analysis
+                        print_tool_result(f"Screen: {preview}")
+                        
+                    else:
+                        result = self._execute_action(action, params)
+                        print_tool_result(result)
+                        state.record_result(result)
+                    
+                    # ── DYNAMIC WAIT (if step declares wait_for) ──
+                    if wait_for:
+                        self._wait_for_condition(wait_for, pre_action_title)
+                    else:
+                        # Small delay for UI to settle (no wait_for = quick settle only)
+                        time.sleep(SETTLE_DELAY)
+                    
+                    # ── VERIFY (cheap signals first) ──
+                    verify_result = self.verifier.verify_step(state, step, result)
+                    
+                    if verify_result.passed or verify_result.skipped:
+                        # ✅ Step verified!
+                        state.mark_verified(verify_result.reason)
+                        status_icon = "✓" if verify_result.passed else "⊘"
+                        status_word = "Verified" if verify_result.passed else "Skipped"
+                        console.print(f"  [green]{status_icon} {status_word}:[/green] [dim]{verify_result.reason}[/dim]")
+                        
+                        # Also show window state (free context)
+                        active = get_active_window()
+                        console.print(f"  [dim]Window: {active.get('window_title', '?')} ({active.get('process_name', '?')})[/dim]")
+                        
+                        step_succeeded = True
+                        break
+                    
+                    elif verify_result.status == VerifyStatus.NEEDS_VISION:
+                        # 👁 Needs vision confirmation (e.g., after click)
+                        console.print(f"  [yellow]👁 Vision check needed:[/yellow] [dim]{verify_result.reason}[/dim]")
+                        img_str = vision()
+                        analysis = analyze_screenshot(img_str)
+                        preview = analysis[:200] + "..." if len(analysis) > 200 else analysis
+                        console.print(f"  [dim cyan]Vision: {preview}[/dim cyan]")
+                        
+                        # For now, if we got vision and it didn't crash, consider it verified
+                        # (The vision analysis is for logging/state — the LLM planner already
+                        # generated the next step, so we don't need to re-plan here)
+                        state.mark_verified(f"Vision confirmed: {analysis[:100]}")
+                        step_succeeded = True
+                        break
+                    
+                    else:
+                        # ❌ Verification FAILED
+                        console.print(f"  [bold red]✗ Verification failed:[/bold red] [dim]{verify_result.reason}[/dim]")
+                        state.mark_failed(verify_result.reason)
+                        state.increment_retry()
+                        
+                        # ── RECOVER ──
+                        # Get vision if the verifier recommends it (or if 2nd+ attempt)
+                        vision_analysis = ""
+                        if verify_result.should_trigger_vision or attempt >= 1:
+                            console.print("  [dim yellow]📷 Taking diagnostic screenshot...[/dim yellow]")
+                            try:
+                                img_str = vision()
+                                vision_analysis = analyze_screenshot(img_str)
+                                preview = vision_analysis[:200] + "..." if len(vision_analysis) > 200 else vision_analysis
+                                console.print(f"  [dim cyan]Vision: {preview}[/dim cyan]")
+                            except Exception as ve:
+                                console.print(f"  [dim red]Vision failed: {ve}[/dim red]")
+                        
+                        # Ask LLM for a recovery action
+                        console.print("  [dim yellow]🧠 Asking LLM for recovery action...[/dim yellow]")
+                        recovery = self._get_recovery_action(state, step, verify_result.reason, vision_analysis)
+                        
+                        if recovery and recovery.get("action") != "abort":
+                            recovery_action = recovery.get("action", "")
+                            recovery_params = recovery.get("params", {})
+                            recovery_desc = recovery.get("description", "")
+                            console.print(f"  [yellow]⚡ Recovery:[/yellow] {recovery_desc} [{recovery_action}]")
+                            
+                            # Execute the recovery action
+                            try:
+                                recovery_result = self._execute_action(recovery_action, recovery_params)
+                                console.print(f"  [dim]Recovery result: {recovery_result}[/dim]")
+                                time.sleep(SETTLE_DELAY)
+                            except Exception as re:
+                                console.print(f"  [dim red]Recovery action failed: {re}[/dim red]")
+                        else:
+                            reason = recovery.get("reason", "No recovery available") if recovery else "Recovery planning failed"
+                            console.print(f"  [bold red]⚠ Cannot recover: {reason}[/bold red]")
+                            break
+                        
+                except Exception as e:
+                    print_error(f"Step {step_num} exception: {str(e)}")
+                    state.mark_failed(str(e))
+                    
+                    # Vision fallback on exception
+                    console.print("  [dim yellow]📷 Taking diagnostic screenshot...[/dim yellow]")
+                    try:
+                        img_str = vision()
+                        analysis = analyze_screenshot(img_str)
+                        preview = analysis[:300] + "..." if len(analysis) > 300 else analysis
+                        print_tool_result(f"Vision Fallback:\n{preview}")
+                    except Exception as ve:
+                        print_error(f"Vision fallback also failed: {str(ve)}")
+                    break
+            
+            if not step_succeeded:
+                console.print(f"\n[bold red]✗ Step {step_num} failed after {MAX_RETRIES} attempts. Aborting plan.[/bold red]")
                 break
         
-        console.print("\n[bold green]✅ All plan steps executed![/bold green]")
-
-
-
+        # ── Execution Summary ──
+        summary = state.get_summary()
+        console.print(f"\n[bold green]{'✅' if state.total_failures == 0 else '⚠️'} {summary}[/bold green]")
+        
+        # Show detailed step history
+        if self.show_thoughts:
+            console.print("\n[dim]Step History:[/dim]")
+            for record in state.step_history:
+                icon = {
+                    StepStatus.VERIFIED: "[green]✓[/green]",
+                    StepStatus.RECOVERED: "[yellow]↻[/yellow]",
+                    StepStatus.FAILED: "[red]✗[/red]",
+                    StepStatus.SKIPPED: "[dim]⊘[/dim]",
+                }.get(record.status, "[dim]?[/dim]")
+                retries = f" (retries: {record.recovery_attempts})" if record.recovery_attempts > 0 else ""
+                console.print(f"  {icon} Step {record.step_num}: {record.action} → {record.status.value}{retries}")

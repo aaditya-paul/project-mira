@@ -1,0 +1,171 @@
+name: send_whatsapp
+description: "Send a WhatsApp message to a specific contact"
+
+triggers:
+  - "send {contact} a whatsapp"
+  - "whatsapp {contact}"
+  - "message {contact} on whatsapp"
+  - "text {contact}"
+  - "tell {contact} {message}"
+  - "send a message to {contact}"
+  - "send {contact} a message"
+  - "whatsapp {contact} saying {message}"
+
+variables:
+  contact:
+    description: "The contact name to message"
+    required: true
+  message:
+    description: "The message to send. If user says something like 'tell june not to marry', compose a proper natural message, don't copy raw text."
+    required: true
+    compose: true  # Flag: LLM should compose this into a natural message
+
+steps:
+  #
+  # STEP 1: Switch to WhatsApp
+  # ──────────────────────────
+  # WhatsApp desktop app must be running.
+  # If not running, the executor will try to launch it.
+  #
+  - action: switch_to_app
+    params:
+      app_name: "WhatsApp"
+    description: "Bring WhatsApp to foreground"
+    expect: "whatsapp_foreground"
+    risk_level: "medium"
+    notes: >
+      WhatsApp desktop app should be running. The window title might show
+      the last active chat (e.g., "June - WhatsApp") — that's fine.
+      
+      The WhatsApp process name is "whatsapp" (sometimes "whatsapp.root").
+      
+      IMPORTANT: There are TWO WhatsApp entries possible:
+        1. WhatsApp desktop app (process: whatsapp) — THIS is what we want
+        2. WhatsApp Web in Edge (title contains "WhatsApp") — DO NOT use this
+      
+      The executor should prefer the desktop app process "whatsapp" over
+      any browser window containing "WhatsApp" in the title.
+
+  #
+  # STEP 2: Open the search/new chat bar
+  # ─────────────────────────────────────
+  # In WhatsApp Desktop, Ctrl+F opens the search bar at the top.
+  # This lets us search for contacts by name.
+  #
+  - action: type_keyboard
+    params:
+      hotkey: "ctrl,f"
+    description: "Open the search bar in WhatsApp (Ctrl+F)"
+    expect: "search_bar_focused"
+    risk_level: "medium"
+    notes: >
+      WhatsApp Desktop uses Ctrl+F to open the contact/chat search bar.
+      This is DIFFERENT from browser Ctrl+F (find in page).
+      
+      After pressing Ctrl+F, a search text field appears at the top of the chat list.
+      The cursor is automatically placed in this field — ready to type.
+      
+      Alternative: You could also click the "Search" icon, but keyboard is faster.
+      
+      EDGE CASE: If a chat is already open, Ctrl+F might open the in-chat search 
+      instead of the contact search. In that case, press Escape first to go back 
+      to the main view, then try Ctrl+F again.
+
+  #
+  # STEP 3: Type the contact name
+  # ─────────────────────────────
+  # Type the contact's name to search for them.
+  # Results appear as you type.
+  #
+  - action: type_keyboard
+    params:
+      text: "{contact}"
+    description: "Type the contact name to search"
+    expect: "search_results_visible"
+    risk_level: "low"
+    notes: >
+      Type the EXACT name as it appears in the user's contacts.
+      WhatsApp will show matching contacts as you type.
+      
+      CASE SENSITIVITY: WhatsApp search is case-insensitive, so "june" = "June".
+      
+      COMMON PITFALL: If the contact name has special characters or is very short
+      (like "Jo"), multiple results may appear. We rely on the first result being correct.
+      The user should use distinctive enough names.
+
+  #
+  # STEP 4: Wait briefly, then select the contact
+  # ──────────────────────────────────────────────
+  # Give WhatsApp a moment to show search results, then press Enter/Down+Enter
+  # to select the first matching contact.
+  #
+  - action: type_keyboard
+    params:
+      hotkey: "enter"
+    description: "Select the first matching contact from search results"
+    expect: "chat_opened"
+    risk_level: "medium"
+    notes: >
+      Pressing Enter selects the first contact in the search results.
+      This opens their chat window.
+      
+      After this, the cursor should be in the message input field at the bottom
+      of the chat. You can immediately start typing the message.
+      
+      VERIFICATION: The window title should change to show the contact's name
+      (e.g., "June - WhatsApp" or similar).
+      
+      FAILURE CASE: If no results matched, pressing Enter might do nothing.
+      If the wrong contact was selected, the message will go to the wrong person.
+      This is a MEDIUM risk step — verify if possible.
+
+  #
+  # STEP 5: Type the message
+  # ────────────────────────
+  # The cursor is now in the message input field.
+  # Type the composed message.
+  #
+  - action: type_keyboard
+    params:
+      text: "{message}"
+    description: "Type the message"
+    expect: "message_typed"
+    risk_level: "low"
+    notes: >
+      The cursor should already be in the message input field after selecting the contact.
+      
+      MESSAGE COMPOSITION RULES:
+      - Write as if you ARE the user talking to their friend
+      - Use natural, conversational tone
+      - Include appropriate greetings ("Hey June,")
+      - Don't copy the user's raw instruction text as the message
+      - Keep it concise but complete
+      
+      EXAMPLE:
+        User says: "tell june dont marry yet bad news"
+        BAD message: "dont marry yet bad news"
+        GOOD message: "Hey June, please hold off on the marriage plans for now. I have some important news I need to share with you first."
+      
+      ENCODING: Only use standard ASCII characters. Emoji support depends on the system.
+
+  #
+  # STEP 6: Send the message
+  # ────────────────────────
+  # Press Enter to send.
+  #
+  - action: type_keyboard
+    params:
+      hotkey: "enter"
+    description: "Send the message by pressing Enter"
+    expect: "message_sent"
+    risk_level: "low"
+    notes: >
+      Pressing Enter sends the message in WhatsApp.
+      
+      IMPORTANT: In WhatsApp Desktop, Enter = Send. 
+      Shift+Enter = New line (does NOT send).
+      
+      After sending, the message should appear in the chat as a sent message
+      (with a checkmark or similar indicator).
+      
+      This is the FINAL step. The message is now sent and cannot be undone.

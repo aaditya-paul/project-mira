@@ -1,6 +1,15 @@
+import sys
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+
+# Force UTF-8 output so box-drawing characters in the banner render correctly
+# regardless of the Windows terminal's default codepage (e.g., cp1252)
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 console = Console()
 

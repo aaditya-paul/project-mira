@@ -1,0 +1,97 @@
+name: play_music
+description: "Play music on YouTube Music in the browser"
+
+triggers:
+  - "play {song}"
+  - "play music"
+  - "play {song} on youtube music"
+  - "play some music"
+  - "put on {song}"
+  - "listen to {song}"
+
+variables:
+  song:
+    description: "The song, artist, or genre to play. If empty, just open YouTube Music."
+    required: false
+    default: ""
+  browser:
+    description: "Which browser to use"
+    default: "Brave Browser"
+
+steps:
+  # STEP 1: Switch to browser
+  - action: switch_to_app
+    params:
+      app_name: "{browser}"
+    description: "Bring the browser to foreground"
+    expect: "browser_foreground"
+    risk_level: "medium"
+    notes: >
+      If browser is not open, this should launch it.
+
+  # STEP 2: Focus address bar
+  - action: type_keyboard
+    params:
+      hotkey: "ctrl,l"
+    description: "Focus the address bar"
+    expect: "address_bar_focused"
+    risk_level: "low"
+
+   # STEP 3: Navigate to YouTube Music
+  - action: type_keyboard
+    params:
+      text: "music.youtube.com"
+    description: "Type YouTube Music URL"
+    expect: "url_typed"
+    risk_level: "low"
+
+  # STEP 4: Load page
+  - action: type_keyboard
+    params:
+      hotkey: "enter"
+    description: "Open YouTube Music"
+    expect: "ytmusic_loaded"
+    risk_level: "low"
+    wait_for:
+      title_contains: "YouTube Music"
+      timeout: 15
+
+  # STEP 5: Focus search bar
+  - action: type_keyboard
+    params:
+      hotkey: "/"
+    description: "Focus search bar using '/' shortcut"
+    expect: "search_focused"
+    risk_level: "low"
+    condition: "song_specified"
+    notes: >
+      YouTube Music supports "/" as a shortcut to focus search.
+
+  # STEP 6: Type song
+  - action: type_keyboard
+    params:
+      text: "{song}"
+    description: "Type song or artist"
+    expect: "search_typed"
+    risk_level: "low"
+    condition: "song_specified"
+
+  # STEP 7: Search and Play
+  - action: type_keyboard
+    params:
+      hotkey: "enter"
+    description: "Execute search"
+    expect: "results_loaded"
+    risk_level: "low"
+    condition: "song_specified"
+
+  # STEP 8: Autoplay first result
+  - action: type_keyboard
+    params:
+      hotkey: "enter"
+    description: "Trigger playback on top result"
+    expect: "music_playing"
+    risk_level: "medium"
+    condition: "song_specified"
+    notes: >
+      Double Enter ensures the top result starts playing immediately.
