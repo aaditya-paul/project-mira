@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 from openai import OpenAI
+from agent.voice.personality import get_compose_instruction, resolve_personality
 
 logger = logging.getLogger("mira.playbooks")
 
@@ -131,11 +132,14 @@ class PlaybookEngine:
 
         # Get user profile from config for variable substitution
         user_profile = self.config.get("user_profile", {})
+        personality_name, personality_profile, _ = resolve_personality(self.config)
+        compose_instruction = get_compose_instruction(self.config, personality_name)
         profile_str = ""
         if user_profile:
             profile_str = "\n\nUSER PROFILE (use this info to fill variables):\n"
             for k, v in user_profile.items():
                 profile_str += f"  {k}: {v}\n"
+            profile_str += f"  active_personality: {personality_profile.get('display_name', personality_name)}\n"
 
         match_prompt = f"""You are an INTENT MATCHER for a desktop automation agent.
 
@@ -153,7 +157,7 @@ RULES:
 1. Match the task to the BEST playbook. Consider triggers and description.
 2. Extract ALL required variables from the task text.
 3. For URL aliases (like "emails" → "gmail.com"), resolve them automatically.
-4. For "compose" variables (like messages), write a natural, conversational message as if YOU are the user speaking to their friend. Include greetings, proper tone, and the key information.
+4. For "compose" variables (like messages), apply this active compose style exactly: {compose_instruction}
 5. Use the USER PROFILE data when relevant (e.g., default browser).
 6. Treat "open_app" and "open_url" as generic playbooks. Use them ONLY for pure open/switch/navigation requests with no additional objective.
 7. If the task includes a secondary objective (send/message/DM/play/search/etc.) and no specialized playbook matches, set playbook to "none" so a new playbook can be created.

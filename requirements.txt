@@ -30,13 +30,16 @@ PyGetWindow==0.0.9
 Pygments==2.20.0
 PyMsgBox==2.0.1
 pyperclip==1.11.0
+PyAudio==0.2.14
 PyRect==0.2.0
 PyScreeze==1.0.1
+pyttsx3==2.99
 python-dotenv==1.2.2
 pytweening==1.2.0
 pywin32==311
 pywinauto==0.6.9
 PyYAML==6.0.3
+SpeechRecognition==3.16.0
 requests==2.33.1
 rich==15.0.0
 six==1.17.0

@@ -5,7 +5,17 @@ import logging
 from openai import OpenAI
 from pathlib import Path
 
-from agent.primitives import vision, move_mouse, click_mouse, scroll_mouse, type_keyboard, analyze_screenshot, switch_to_app, launch_app
+from agent.primitives import (
+    vision,
+    move_mouse,
+    click_mouse,
+    scroll_mouse,
+    type_keyboard,
+    run_command,
+    analyze_screenshot,
+    switch_to_app,
+    launch_app,
+)
 from agent.browser import (
     browser_navigate, browser_click, browser_type, browser_press_key,
     browser_get_text, browser_get_state, browser_new_tab, browser_close_tab,
@@ -17,6 +27,7 @@ from agent.state import AgentState, StepStatus, RiskLevel
 from agent.verify import Verifier, VerifyStatus
 from agent.playbooks import PlaybookEngine
 from agent.learning import PlaybookArchitect
+from agent.voice.personality import load_system_prompt, resolve_personality
 
 # Tool schema mapping
 TOOLS = [
@@ -401,6 +412,36 @@ TOOLS = [
                 "required": ["thought_process"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a local shell command (PowerShell or cmd) and return stdout/stderr.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why this command is needed."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "The command text to execute."
+                    },
+                    "shell": {
+                        "type": "string",
+                        "enum": ["auto", "powershell", "cmd"],
+                        "description": "Shell selection. Default is auto."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Max execution time in seconds (default 30)."
+                    }
+                },
+                "required": ["thought_process", "command"]
+            }
+        }
     }
 ]
 
@@ -416,6 +457,12 @@ def execute_tool(name: str, args: dict) -> str:
         return scroll_mouse(args.get("clicks", 0))
     elif name == "type_keyboard":
         return type_keyboard(args.get("text", ""), args.get("hotkey", ""))
+    elif name == "run_command":
+        return run_command(
+            args.get("command", ""),
+            args.get("shell", "auto"),
+            args.get("timeout_seconds", args.get("timeout", 30)),
+        )
     elif name == "check_app":
         result = check_app_installed(args.get("app_name", ""))
         return json.dumps(result, indent=2)
@@ -455,19 +502,26 @@ SETTLE_DELAY = 0.3        # Seconds to wait after action for UI to settle
 APP_SWITCH_DELAY = 1.0    # Seconds to wait after app switch for window to render
 WAIT_POLL_INTERVAL = 0.5  # Seconds between polls when waiting for a condition
 WAIT_DEFAULT_TIMEOUT = 15 # Default timeout for wait_for conditions
+VOICE_CONTROL_POLL_SECONDS = 0.2
 
 
 class AgentBrain:
-    def __init__(self):
+    def __init__(self, voice_coordinator=None):
         with open("config.json", "r", encoding="utf-8") as f:
             self.config = json.load(f)
             
+        self.voice_coordinator = voice_coordinator
+        self._voice_paused = False
+        self._runtime_interrupt = None
+        self._current_task_prompt = ""
+        self.personality_name = "friendly"
+        self.personality_profile = {}
+
         self.fallback_chain = self.config.get("fallback_chain", [])
         self.show_thoughts = self.config.get("show_thoughts", True)
         self.providers = self.config.get("providers", {})
-        
-        with open(Path("prompts") / "system_prompt.txt", "r", encoding="utf-8") as f:
-            self.system_prompt = f.read()
+        self.system_prompt = load_system_prompt(self.config)
+        self.personality_name, self.personality_profile, _ = resolve_personality(self.config)
 
         self.clients = self._init_clients()
         self.verifier = Verifier()
@@ -496,6 +550,151 @@ class AgentBrain:
                     api_key=os.environ.get("NVIDIA_API_KEY", "")
                 )
         return clients
+
+    def attach_voice_coordinator(self, voice_coordinator):
+        self.voice_coordinator = voice_coordinator
+
+    def save_config(self):
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(self.config, f, indent=2)
+
+    def set_personality(self, requested_name: str) -> str:
+        resolved, profile, _ = resolve_personality(self.config, requested_name)
+        self.config.setdefault("user_profile", {})["personality"] = resolved
+        self.personality_name = resolved
+        self.personality_profile = profile
+        self.system_prompt = load_system_prompt(self.config, resolved)
+        self.playbook_engine.config = self.config
+        return resolved
+
+    def _emit_voice_event(self, event_type: str, **payload):
+        if not self.voice_coordinator:
+            return
+        try:
+            self.voice_coordinator.emit_event(event_type, **payload)
+        except Exception as e:
+            logger.debug("Voice event emit failed: %s", e)
+
+    def _update_voice_snapshot(self, phase: str, task_prompt: str = "", state: AgentState | None = None):
+        if not self.voice_coordinator:
+            return
+
+        snapshot = {
+            "phase": phase,
+            "task": task_prompt,
+            "personality": self.personality_name,
+        }
+
+        if state and state.current_step:
+            snapshot["current_step"] = state.current_step.step_num
+            snapshot["current_action"] = state.current_step.action
+            snapshot["current_description"] = state.current_step.description
+
+        try:
+            self.voice_coordinator.update_state(**snapshot)
+        except Exception as e:
+            logger.debug("Voice state update failed: %s", e)
+
+    def _handle_single_voice_command(self, command: dict, task_prompt: str = "", state: AgentState | None = None) -> tuple[str, str | None]:
+        action = str(command.get("action", "")).strip().lower()
+
+        if action == "heard_ignored":
+            return "continue", None
+
+        if action == "pause_task":
+            self._voice_paused = True
+            self._emit_voice_event("status_report", message="Pausing task at the next safe checkpoint.")
+            return "continue", None
+
+        if action == "resume_task":
+            self._voice_paused = False
+            self._emit_voice_event("status_report", message="Resuming task execution.")
+            return "continue", None
+
+        if action == "cancel_task":
+            self._voice_paused = False
+            self._emit_voice_event("task_cancelled", reason="Cancelled by voice command.")
+            return "cancel", None
+
+        if action == "set_personality":
+            requested = str(command.get("personality", "")).strip()
+            if requested:
+                selected = self.set_personality(requested)
+                try:
+                    self.save_config()
+                except Exception as e:
+                    logger.debug("Could not persist personality change: %s", e)
+                self._emit_voice_event(
+                    "personality_changed",
+                    personality=self.personality_profile.get("display_name", selected),
+                    personality_key=selected,
+                )
+            return "continue", None
+
+        if action == "status":
+            if state and state.current_step:
+                message = (
+                    f"I am on step {state.current_step.step_num}: "
+                    f"{state.current_step.description}"
+                )
+            elif task_prompt:
+                message = f"I am preparing the task: {task_prompt}"
+            else:
+                message = "I am idle and ready for your next task."
+            self._emit_voice_event("status_report", message=message)
+            return "continue", None
+
+        if action == "run_task_now":
+            requested_task = str(command.get("task", "")).strip()
+            if requested_task:
+                self._voice_paused = False
+                return "interrupt", requested_task
+            return "continue", None
+
+        return "continue", None
+
+    def _print_voice_transcript(self, command: dict):
+        raw_text = str(command.get("raw_text", "")).strip()
+        action = str(command.get("action", "")).strip().lower()
+        if not raw_text:
+            return
+
+        if action == "heard_ignored":
+            console.print(f"[dim yellow]Voice Heard (wake not matched):[/dim yellow] {raw_text}")
+        else:
+            console.print(f"[bold magenta]Voice Heard:[/bold magenta] {raw_text}")
+
+    def _process_voice_commands(self, task_prompt: str = "", state: AgentState | None = None) -> tuple[str, str | None]:
+        if not self.voice_coordinator:
+            return "continue", None
+
+        while True:
+            command = self.voice_coordinator.poll_command()
+            if not command:
+                break
+            self._print_voice_transcript(command)
+            control, next_task = self._handle_single_voice_command(command, task_prompt, state)
+            if control != "continue":
+                return control, next_task
+
+        while self._voice_paused:
+            self._update_voice_snapshot("paused", task_prompt, state)
+            time.sleep(VOICE_CONTROL_POLL_SECONDS)
+            command = self.voice_coordinator.poll_command()
+            if not command:
+                continue
+            self._print_voice_transcript(command)
+            control, next_task = self._handle_single_voice_command(command, task_prompt, state)
+            if control != "continue":
+                return control, next_task
+
+        return "continue", None
+
+    def process_idle_voice_commands(self) -> str | None:
+        control, next_task = self._process_voice_commands(task_prompt="", state=None)
+        if control == "interrupt" and next_task:
+            return next_task
+        return None
 
     def is_vision_model(self, model_name: str, provider: str) -> bool:
         """Determines if a model is vision-capable based on name or provider."""
@@ -901,6 +1100,12 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
             return scroll_mouse(params.get("clicks", 0))
         elif action == "move_mouse":
             return move_mouse(params.get("x", 0), params.get("y", 0))
+        elif action == "run_command":
+            return run_command(
+                params.get("command", ""),
+                params.get("shell", "auto"),
+                params.get("timeout_seconds", params.get("timeout", 30)),
+            )
         # ── Browser actions (Playwright CDP) ──
         elif action == "browser_navigate":
             return browser_navigate(params.get("url", ""))
@@ -955,6 +1160,15 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
         start = time.time()
         polls = 0
         while (time.time() - start) < timeout:
+            control, next_task = self._process_voice_commands(task_prompt=self._current_task_prompt, state=None)
+            if control in {"cancel", "interrupt"}:
+                self._runtime_interrupt = {
+                    "control": control,
+                    "next_task": next_task,
+                }
+                console.print("  [yellow]Voice control requested while waiting. Exiting wait loop.[/yellow]")
+                return False
+
             time.sleep(WAIT_POLL_INTERVAL)
             polls += 1
 
@@ -1048,31 +1262,45 @@ Example outputs:
 
     def run_agentic_loop(self, task_prompt: str):
         """
-        Main execution loop: Plan → Act → Verify → Correct
-        
-        Architecture:
-        1. PLAN: Generate step-by-step plan with LLM
-        2. EXECUTE: Run each step's action
-        3. VERIFY: Check outcome with cheap signals (window title, process, etc.)
-        4. RECOVER: If verification fails, use vision + LLM to generate a fix
-        5. RETRY: Re-attempt the step (up to MAX_RETRIES times)
+        Main execution loop: Plan → Act → Verify → Correct.
+
+        Returns a status payload so the caller can handle voice interruptions and
+        immediately start injected follow-up tasks.
         """
         logger.info(f"--- Starting Agentic Loop for Task: {task_prompt} ---")
-        
-        # ── Phase 0: Gather system context ──
+
+        self._runtime_interrupt = None
+        self._voice_paused = False
+        self._current_task_prompt = task_prompt
+
+        self._emit_voice_event("task_start", task=task_prompt)
+        self._update_voice_snapshot("running", task_prompt=task_prompt, state=None)
+
+        # Respect runtime voice controls before expensive planning.
+        control, injected_task = self._process_voice_commands(task_prompt=task_prompt, state=None)
+        if control == "cancel":
+            self._update_voice_snapshot("idle", task_prompt="", state=None)
+            return {"status": "cancelled", "next_task": None, "summary": "Cancelled before planning."}
+        if control == "interrupt" and injected_task:
+            self._update_voice_snapshot("idle", task_prompt="", state=None)
+            return {"status": "interrupted", "next_task": injected_task, "summary": "Interrupted before planning."}
+
+        # Phase 0: Gather context
         console.print("[dim cyan]Gathering system context...[/dim cyan]")
         context_snapshot = build_context_snapshot()
         console.print(f"[dim]{context_snapshot}[/dim]")
-        
-        # ── Phase 1: Generate Plan ──
+
+        # Phase 1: Generate plan
         console.print("\n[bold yellow]📋 Phase 1: Generating step-by-step plan...[/bold yellow]")
         plan = self._generate_plan(task_prompt, context_snapshot)
-        
+
         if not plan:
             print_error("Failed to generate a plan. Aborting.")
-            return
-        
-        # Display the plan
+            self._emit_voice_event("task_failed", reason="Failed to generate a plan.")
+            self._update_voice_snapshot("idle", task_prompt="", state=None)
+            self._current_task_prompt = ""
+            return {"status": "failed", "next_task": None, "summary": "Plan generation failed."}
+
         console.print(f"\n[bold green]✅ Plan generated ({len(plan)} steps):[/bold green]")
         for step in plan:
             step_num = step.get("step", "?")
@@ -1082,7 +1310,7 @@ Example outputs:
             risk = step.get("risk_level", "low")
             expect = step.get("expect", "")
             param_str = ", ".join(f"{k}={v}" for k, v in params.items())
-            
+
             risk_color = {"low": "green", "medium": "yellow", "high": "red"}.get(risk, "white")
             console.print(
                 f"  [dim]{step_num}. [{action}] {desc}[/dim]"
@@ -1091,118 +1319,151 @@ Example outputs:
                 + (f" [dim magenta]→ {expect}[/dim magenta]" if expect else "")
             )
         console.print()
-        
-        # ── Phase 2: Smart Execution with Verify → Correct Loop ──
+
+        # Phase 2: Execute + verify + recover
         console.print("[bold yellow]⚡ Phase 2: Executing with verification...[/bold yellow]\n")
-        
+
         from agent.context import get_active_window
-        
-        # Initialize state memory
+
         state = AgentState(task=task_prompt)
-        
+        run_status = "completed"
+        next_task = None
+
         for step in plan:
+            control, injected_task = self._process_voice_commands(task_prompt=task_prompt, state=state)
+            if control == "cancel":
+                run_status = "cancelled"
+                break
+            if control == "interrupt" and injected_task:
+                run_status = "interrupted"
+                next_task = injected_task
+                break
+
             step_num = step.get("step", "?")
             action = step.get("action", "")
             params = step.get("params", {})
             description = step.get("description", "")
-            risk = step.get("risk_level", "low")
-            expect = step.get("expect", "")
             wait_for = step.get("wait_for", None)
-            
+
             console.print(f"[bold cyan]── Step {step_num}: {description} ──[/bold cyan]")
-            
-            # Snapshot the window title BEFORE the action (for title_changed detection)
+            self._emit_voice_event("step_started", step=step_num, description=description, action=action)
+
             pre_action_window = get_active_window()
             pre_action_title = pre_action_window.get("window_title", "")
-            
-            # Begin tracking this step
-            record = state.begin_step(step)
+
+            state.begin_step(step)
+            self._update_voice_snapshot("running", task_prompt=task_prompt, state=state)
+
             step_succeeded = False
-            
+
             for attempt in range(MAX_RETRIES):
                 if attempt > 0:
                     console.print(f"  [bold yellow]↻ Retry {attempt}/{MAX_RETRIES - 1}...[/bold yellow]")
-                
+
+                control, injected_task = self._process_voice_commands(task_prompt=task_prompt, state=state)
+                if control == "cancel":
+                    run_status = "cancelled"
+                    break
+                if control == "interrupt" and injected_task:
+                    run_status = "interrupted"
+                    next_task = injected_task
+                    break
+
                 try:
-                    # ── EXECUTE ──
                     result = ""
-                    
+
                     if action == "switch_to_app":
                         app_name = params.get("app_name", "")
                         result = switch_to_app(app_name)
-                        
-                        # If switch failed, try launching the app
+
                         if "not found" in result.lower():
                             launched = self._launch_and_wait(app_name)
                             if not launched:
                                 print_error(f"Cannot open {app_name}. Aborting plan.")
                                 state.mark_failed(f"Cannot open {app_name}")
-                                return
+                                run_status = "failed"
+                                break
                             result = f"Launched and switched to {app_name}"
-                        
+
                         print_tool_result(result)
                         state.record_result(result)
-                        
-                        # Vision on app switch — this is intentional (first time seeing the UI)
+
                         console.print("  [dim cyan]📷 Scanning app state (first entry)...[/dim cyan]")
                         time.sleep(APP_SWITCH_DELAY)
                         img_str = vision()
                         analysis = analyze_screenshot(img_str)
                         preview = analysis[:200] + "..." if len(analysis) > 200 else analysis
                         print_tool_result(f"Screen: {preview}")
-                        
                     else:
                         result = self._execute_action(action, params)
                         print_tool_result(result)
                         state.record_result(result)
-                    
-                    # ── DYNAMIC WAIT (if step declares wait_for) ──
+
                     if wait_for:
                         self._wait_for_condition(wait_for, pre_action_title)
                     else:
-                        # Small delay for UI to settle (no wait_for = quick settle only)
                         time.sleep(SETTLE_DELAY)
-                    
-                    # ── VERIFY (cheap signals first) ──
+
+                    if self._runtime_interrupt:
+                        requested_control = self._runtime_interrupt.get("control", "cancel")
+                        if requested_control == "interrupt":
+                            run_status = "interrupted"
+                        elif requested_control == "cancel":
+                            run_status = "cancelled"
+                        else:
+                            run_status = requested_control
+                        next_task = self._runtime_interrupt.get("next_task")
+                        self._runtime_interrupt = None
+                        break
+
                     verify_result = self.verifier.verify_step(state, step, result)
-                    
+
                     if verify_result.passed or verify_result.skipped:
-                        # ✅ Step verified!
                         state.mark_verified(verify_result.reason)
                         status_icon = "✓" if verify_result.passed else "⊘"
                         status_word = "Verified" if verify_result.passed else "Skipped"
                         console.print(f"  [green]{status_icon} {status_word}:[/green] [dim]{verify_result.reason}[/dim]")
-                        
-                        # Also show window state (free context)
+
                         active = get_active_window()
                         console.print(f"  [dim]Window: {active.get('window_title', '?')} ({active.get('process_name', '?')})[/dim]")
-                        
+
+                        self._emit_voice_event(
+                            "step_verified",
+                            step=step_num,
+                            description=description,
+                            reason=verify_result.reason,
+                        )
                         step_succeeded = True
                         break
-                    
+
                     elif verify_result.status == VerifyStatus.NEEDS_VISION:
-                        # 👁 Needs vision confirmation (e.g., after click)
                         console.print(f"  [yellow]👁 Vision check needed:[/yellow] [dim]{verify_result.reason}[/dim]")
                         img_str = vision()
                         analysis = analyze_screenshot(img_str)
                         preview = analysis[:200] + "..." if len(analysis) > 200 else analysis
                         console.print(f"  [dim cyan]Vision: {preview}[/dim cyan]")
-                        
-                        # For now, if we got vision and it didn't crash, consider it verified
-                        # (The vision analysis is for logging/state — the LLM planner already
-                        # generated the next step, so we don't need to re-plan here)
+
                         state.mark_verified(f"Vision confirmed: {analysis[:100]}")
+                        self._emit_voice_event(
+                            "step_verified",
+                            step=step_num,
+                            description=description,
+                            reason="Vision confirmed",
+                        )
                         step_succeeded = True
                         break
-                    
+
                     else:
-                        # ❌ Verification FAILED
                         console.print(f"  [bold red]✗ Verification failed:[/bold red] [dim]{verify_result.reason}[/dim]")
                         state.mark_failed(verify_result.reason)
                         state.increment_retry()
-                        
-                        # ── RECOVER ──
-                        # Get vision if the verifier recommends it (or if 2nd+ attempt)
+                        self._emit_voice_event(
+                            "step_failed",
+                            step=step_num,
+                            description=description,
+                            reason=verify_result.reason,
+                        )
+
                         vision_analysis = ""
                         if verify_result.should_trigger_vision or attempt >= 1:
                             console.print("  [dim yellow]📷 Taking diagnostic screenshot...[/dim yellow]")
@@ -1213,18 +1474,16 @@ Example outputs:
                                 console.print(f"  [dim cyan]Vision: {preview}[/dim cyan]")
                             except Exception as ve:
                                 console.print(f"  [dim red]Vision failed: {ve}[/dim red]")
-                        
-                        # Ask LLM for a recovery action
+
                         console.print("  [dim yellow]🧠 Asking LLM for recovery action...[/dim yellow]")
                         recovery = self._get_recovery_action(state, step, verify_result.reason, vision_analysis)
-                        
+
                         if recovery and recovery.get("action") != "abort":
                             recovery_action = recovery.get("action", "")
                             recovery_params = recovery.get("params", {})
                             recovery_desc = recovery.get("description", "")
                             console.print(f"  [yellow]⚡ Recovery:[/yellow] {recovery_desc} [{recovery_action}]")
-                            
-                            # Execute the recovery action
+
                             try:
                                 recovery_result = self._execute_action(recovery_action, recovery_params)
                                 console.print(f"  [dim]Recovery result: {recovery_result}[/dim]")
@@ -1235,12 +1494,12 @@ Example outputs:
                             reason = recovery.get("reason", "No recovery available") if recovery else "Recovery planning failed"
                             console.print(f"  [bold red]⚠ Cannot recover: {reason}[/bold red]")
                             break
-                        
+
                 except Exception as e:
                     print_error(f"Step {step_num} exception: {str(e)}")
                     state.mark_failed(str(e))
-                    
-                    # Vision fallback on exception
+                    self._emit_voice_event("step_failed", step=step_num, description=description, reason=str(e))
+
                     console.print("  [dim yellow]📷 Taking diagnostic screenshot...[/dim yellow]")
                     try:
                         img_str = vision()
@@ -1250,16 +1509,18 @@ Example outputs:
                     except Exception as ve:
                         print_error(f"Vision fallback also failed: {str(ve)}")
                     break
-            
+
+            if run_status in {"cancelled", "interrupted", "failed"}:
+                break
+
             if not step_succeeded:
+                run_status = "failed"
                 console.print(f"\n[bold red]✗ Step {step_num} failed after {MAX_RETRIES} attempts. Aborting plan.[/bold red]")
                 break
-        
-        # ── Execution Summary ──
+
         summary = state.get_summary()
         console.print(f"\n[bold green]{'✅' if state.total_failures == 0 else '⚠️'} {summary}[/bold green]")
-        
-        # Show detailed step history
+
         if self.show_thoughts:
             console.print("\n[dim]Step History:[/dim]")
             for record in state.step_history:
@@ -1271,3 +1532,21 @@ Example outputs:
                 }.get(record.status, "[dim]?[/dim]")
                 retries = f" (retries: {record.recovery_attempts})" if record.recovery_attempts > 0 else ""
                 console.print(f"  {icon} Step {record.step_num}: {record.action} → {record.status.value}{retries}")
+
+        if run_status == "completed" and state.total_failures == 0:
+            self._emit_voice_event("task_completed", summary=summary)
+        elif run_status == "cancelled":
+            self._emit_voice_event("task_cancelled", reason="Cancelled by command.")
+        elif run_status == "interrupted":
+            self._emit_voice_event("task_cancelled", reason="Interrupted for a new task.")
+        else:
+            self._emit_voice_event("task_failed", reason=summary)
+
+        self._update_voice_snapshot("idle", task_prompt="", state=None)
+        self._current_task_prompt = ""
+
+        return {
+            "status": run_status,
+            "next_task": next_task,
+            "summary": summary,
+        }

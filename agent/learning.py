@@ -25,6 +25,7 @@ logger = logging.getLogger("mira.learning")
 SUPPORTED_ACTIONS = {
     "switch_to_app",
     "type_keyboard",
+    "run_command",
     "click_mouse",
     "scroll_mouse",
     "browser_navigate",

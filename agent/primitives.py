@@ -303,6 +303,91 @@ def type_keyboard(text: str = "", hotkey: str = "", repeat: int = 1) -> str:
         return f"Failed to type/press keys: {str(e)}"
 
 
+def run_command(command: str, shell: str = "auto", timeout_seconds: int = 30) -> str:
+    """Run a local shell command and return a compact stdout/stderr summary."""
+    import subprocess
+
+    cmd = (command or "").strip()
+    if not cmd:
+        return "Failed to run command: empty command."
+
+    try:
+        timeout = int(timeout_seconds)
+    except Exception:
+        timeout = 30
+    timeout = max(1, min(timeout, 300))
+
+    mode = str(shell or "auto").strip().lower()
+    if mode not in {"auto", "powershell", "cmd"}:
+        return f"Failed to run command: unsupported shell '{mode}'."
+
+    # Block a few obviously dangerous full-system destructive patterns.
+    lowered = cmd.lower()
+    blocked_patterns = (
+        "rm -rf /",
+        "rd /s /q c:\\",
+        "del /f /s /q c:\\",
+        "format c:",
+        "shutdown /s",
+        "restart-computer",
+        "stop-computer",
+        "remove-item -recurse -force c:\\",
+        "format-volume",
+    )
+    if any(pattern in lowered for pattern in blocked_patterns):
+        return "Failed to run command: blocked by safety guardrails."
+
+    if mode == "powershell":
+        argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd]
+    elif mode == "cmd":
+        argv = ["cmd", "/c", cmd]
+    else:
+        stripped = lowered.lstrip()
+        if stripped.startswith("powershell ") or stripped.startswith("pwsh ") or stripped.startswith("cmd "):
+            argv = ["cmd", "/c", cmd]
+        elif any(token in cmd for token in ("|", ";", "$", "@'", "'@", "`")):
+            argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd]
+        else:
+            argv = ["cmd", "/c", cmd]
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def _clip(text: str, max_len: int = 1800) -> str:
+        return text if len(text) <= max_len else text[:max_len] + "... [truncated]"
+
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Command failed: timed out after {timeout}s."
+    except Exception as e:
+        return f"Failed to run command: {str(e)}"
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+
+    status = (
+        f"Command succeeded (exit code {completed.returncode})."
+        if completed.returncode == 0
+        else f"Command failed (exit code {completed.returncode})."
+    )
+
+    parts = [status]
+    if stdout:
+        parts.append(f"STDOUT:\n{_clip(stdout)}")
+    if stderr:
+        parts.append(f"STDERR:\n{_clip(stderr)}")
+    if not stdout and not stderr:
+        parts.append("No output.")
+
+    return "\n".join(parts)
+
+
 def switch_to_app(app_name: str) -> str:
     """Directly switches to a running app window by matching its title/process name.
     Uses Win32 SetForegroundWindow API via PowerShell — no alt+tab cycling needed.
