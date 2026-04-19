@@ -19,79 +19,58 @@ variables:
     default: "Brave Browser"
 
 steps:
-  # STEP 1: Switch to browser
-  - action: switch_to_app
+  # STEP 1: Navigate to YouTube Music via Playwright
+  - action: browser_navigate
     params:
-      app_name: "{browser}"
-    description: "Bring the browser to foreground"
-    expect: "browser_foreground"
-    risk_level: "medium"
-    notes: >
-      If browser is not open, this should launch it.
-
-  # STEP 2: Focus address bar
-  - action: type_keyboard
-    params:
-      hotkey: "ctrl,l"
-    description: "Focus the address bar"
-    expect: "address_bar_focused"
-    risk_level: "low"
-
-   # STEP 3: Navigate to YouTube Music
-  - action: type_keyboard
-    params:
-      text: "music.youtube.com"
-    description: "Type YouTube Music URL"
-    expect: "url_typed"
-    risk_level: "low"
-
-  # STEP 4: Load page
-  - action: type_keyboard
-    params:
-      hotkey: "enter"
-    description: "Open YouTube Music"
+      url: "music.youtube.com"
+    description: "Open YouTube Music via Playwright CDP"
     expect: "ytmusic_loaded"
     risk_level: "low"
-    wait_for:
-      title_contains: "YouTube Music"
-      timeout: 15
-
-  # STEP 5: Focus search bar
-  - action: type_keyboard
-    params:
-      hotkey: "/"
-    description: "Focus search bar using '/' shortcut"
-    expect: "search_focused"
-    risk_level: "low"
-    condition: "song_specified"
     notes: >
-      YouTube Music supports "/" as a shortcut to focus search.
+      Playwright navigates directly — no switching apps, no ctrl+l, no typing URLs.
+      If the browser isn't running, it auto-launches in debug mode first.
 
-  # STEP 6: Type song
-  - action: type_keyboard
+  # STEP 2: Type song into search (if specified)
+  - action: browser_type
     params:
+      selector: "input[aria-label='Search']"
       text: "{song}"
-    description: "Type song or artist"
+    description: "Type song into YouTube Music search bar"
     expect: "search_typed"
     risk_level: "low"
     condition: "song_specified"
+    notes: >
+      YouTube Music has a search input with aria-label="Search".
+      Playwright finds it by selector — no need for "/" shortcut or vision.
 
-  # STEP 7: Search and Play
-  - action: type_keyboard
+  # STEP 3: Execute search
+  - action: browser_press_key
     params:
-      hotkey: "enter"
+      key: "Enter"
     description: "Execute search"
     expect: "results_loaded"
     risk_level: "low"
     condition: "song_specified"
 
-  # STEP 8: Autoplay first result
-  - action: type_keyboard
+  # STEP 4: Wait for search results list
+  - action: browser_wait_for
     params:
-      hotkey: "enter"
-    description: "Trigger playback on top result"
+      selector: "ytmusic-card-shelf-renderer a[href*='watch?v='], ytmusic-responsive-list-item-renderer a[href*='watch?v=']"
+      timeout: 15
+    description: "Wait for search results to render"
+    expect: "results_visible"
+    risk_level: "low"
+    condition: "song_specified"
+
+  # STEP 5: Click first result to play
+  - action: browser_click
+    params:
+      selector: "ytmusic-card-shelf-renderer a[href*='watch?v=']"
+    description: "Click the first search result to start playback"
     expect: "music_playing"
     risk_level: "medium"
     condition: "song_specified"
     notes: >
-      Double Enter ensures the top result starts playing immediately.
+      Targets the top card-shelf watch link first (usually the true top result).
+      If that fails, browser_click falls back to play buttons, song list links,
+      and finally the first global watch-link on the page.

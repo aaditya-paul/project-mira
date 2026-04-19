@@ -52,103 +52,34 @@ variables:
 
 steps:
   #
-  # STEP 1: Switch to the browser
-  # ─────────────────────────────
-  # The browser might already be open showing any random page.
-  # That's fine — we'll navigate away from it.
-  # If the browser is not running, the executor will auto-launch it.
+  # STEP 1: Navigate directly via Playwright CDP
+  # ─────────────────────────────────────────────
+  # This is the ONLY step needed. Playwright connects to the browser
+  # via CDP (Chrome DevTools Protocol) and navigates programmatically.
+  # No ctrl+l, no typing, no enter — just instant navigation.
   #
-  - action: switch_to_app
+  # If the browser is not running, the browser controller will
+  # automatically launch it in debug mode first.
+  #
+  - action: browser_navigate
     params:
-      app_name: "{browser}"
-    description: "Bring the browser to foreground"
-    expect: "browser_foreground"
-    risk_level: "medium"
-    notes: >
-      If the browser is NOT RUNNING, the executor will automatically launch it.
-      The browser might open showing ANY page (Instagram, Netflix, etc.) — 
-      that is perfectly fine. We are about to navigate away from it.
-      DO NOT panic if the title says "Instagram" or "Netflix" — it's still
-      the correct browser, just on a different tab.
-
-  #
-  # STEP 2: Focus the address bar
-  # ──────────────────────────────
-  # THIS IS THE MOST CRITICAL STEP. 
-  # 
-  # ⚠️  ctrl+l = ADDRESS BAR (what we want)
-  # ⚠️  ctrl+f = FIND IN PAGE (NOT what we want — this searches text ON the current page)
-  # 
-  # NEVER EVER use ctrl+f to navigate to a URL. ALWAYS ctrl+l.
-  #
-  - action: type_keyboard
-    params:
-      hotkey: "ctrl,l"
-    description: "Focus the address bar with Ctrl+L (NOT Ctrl+F!)"
-    expect: "address_bar_focused"
-    risk_level: "medium"
-    notes: >
-      CRITICAL DISTINCTION — memorize this:
-        ctrl+l = FOCUS ADDRESS BAR. This selects the URL in the address bar so you can type a new one.
-        ctrl+f = FIND IN PAGE. This opens a search box that searches for text ON the current page.
-        ctrl+k = some browsers use this for search. NOT what we want.
-      
-      After pressing ctrl+l, the entire current URL in the address bar becomes highlighted/selected.
-      This means anything you type next will REPLACE the old URL automatically.
-      You do NOT need to select-all or delete the old URL first.
-      
-      If ctrl+l fails (rare), alternatives:
-        - Press F6 (some browsers)
-        - Press Alt+D (some browsers)
-        - Click the address bar near the top of the window
-
-  #
-  # STEP 3: Type the URL
-  # ────────────────────
-  # Just type the URL. No "https://" needed — browser adds it.
-  # The old URL was auto-selected in step 2, so typing replaces it.
-  #
-  - action: type_keyboard
-    params:
-      text: "{url}"
-    description: "Type the URL into the address bar"
-    expect: "url_typed"
+      url: "{url}"
+    description: "Navigate to {url} via Playwright CDP"
+    expect: "page_loaded"
     risk_level: "low"
     notes: >
-      The old address bar content was auto-selected by ctrl+l, so typing
-      REPLACES it. You do NOT need to clear it first.
+      Playwright navigates the browser DIRECTLY via CDP — no keyboard
+      interaction needed. The browser controller handles:
+        1. Launching the browser in debug mode (if not already running)
+        2. Connecting via CDP on port 9222
+        3. Navigating the active tab to the URL
+        4. Waiting for the page to load (domcontentloaded)
       
-      Do NOT add "https://" — the browser adds it automatically.
-      Do NOT add "www." — the browser handles this.
+      This is vastly more reliable than ctrl+l → type → enter because:
+        - No risk of typing into the wrong field
+        - No autocomplete interference
+        - No need to wait for address bar focus
+        - Works even if a dialog/popup is blocking keyboard input
       
-      Just type the bare domain: "gmail.com", "youtube.com", etc.
-      
-      If the browser shows autocomplete suggestions, that's fine — 
-      we'll press Enter in the next step to confirm our typed URL.
-
-  #
-  # STEP 4: Navigate (press Enter)
-  # ──────────────────────────────
-  # Press Enter to load the page.
-  #
-  - action: type_keyboard
-    params:
-      hotkey: "enter"
-    description: "Press Enter to navigate to the URL"
-    expect: "page_loading"
-    risk_level: "low"
-    wait_for:
-      title_changed: true
-      timeout: 15
-    notes: >
-      After pressing Enter, the browser will navigate to the URL.
-      The page may take 1-3 seconds to load.
-      The window title will change to reflect the new page (e.g., "Gmail" or "YouTube").
-      The wait_for condition dynamically polls until the title changes.
-      
-      IMPORTANT: If the browser showed autocomplete suggestions, pressing Enter
-      might navigate to the first suggestion instead of our typed URL. 
-      This is usually correct (e.g., typing "gmail" suggests "gmail.com").
-      
-      If login is needed: the user should already be logged in via saved browser session.
-      DO NOT try to type passwords or login credentials — that's a security risk.
+      The browser uses the user's real profile directory, so all cookies,
+      saved passwords, and extensions are available — no cold login needed.

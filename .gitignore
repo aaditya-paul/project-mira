@@ -11,8 +11,10 @@ mira_debug.log
 
 # Mira Temp/Debug
 debug_vision.png
+debug_browser_screenshot.png
 _switch_app.ps1
 _launch_app.ps1
+.playwright_setup_done
 
 # IDEs
 .vscode/

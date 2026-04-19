@@ -6,6 +6,11 @@ from openai import OpenAI
 from pathlib import Path
 
 from agent.primitives import vision, move_mouse, click_mouse, scroll_mouse, type_keyboard, analyze_screenshot, switch_to_app, launch_app
+from agent.browser import (
+    browser_navigate, browser_click, browser_type, browser_press_key,
+    browser_get_text, browser_get_state, browser_new_tab, browser_close_tab,
+    browser_wait_for, browser_scroll, browser_screenshot
+)
 from agent.context import build_context_snapshot, check_app_installed
 from agent.display import console, print_tool_call, print_tool_result, print_final_answer, print_error, print_thought
 from agent.state import AgentState, StepStatus, RiskLevel
@@ -174,6 +179,228 @@ TOOLS = [
                 "required": ["thought_process", "app_name"]
             }
         }
+    },
+    # ── Browser Tools (Playwright CDP) ──
+    # These are PREFERRED over PyAutoGUI for ALL web/browser tasks.
+    # They operate programmatically on the DOM — no coordinate guessing needed.
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_navigate",
+            "description": "Navigate the browser to a URL. Automatically connects to the browser via CDP. PREFERRED over ctrl+l/type for all URL navigation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain what page you want to navigate to and why."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to navigate to. No 'https://' prefix needed. E.g., 'gmail.com', 'music.youtube.com'."
+                    }
+                },
+                "required": ["thought_process", "url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click",
+            "description": "Click an element in the browser by CSS selector or visible text. Much more reliable than coordinate-based clicking.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Describe the element you want to click."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector (e.g., 'button.submit', '#search-icon') or visible text (e.g., 'Sign In', 'Next')."
+                    }
+                },
+                "required": ["thought_process", "selector"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_type",
+            "description": "Type text into a browser input field. Identifies the field by CSS selector, placeholder text, or label.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Describe which input field you're targeting and what you're typing."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector, placeholder text, or label of the input field. E.g., 'input[name=q]', 'Search', '#email'."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The text to type into the field."
+                    },
+                    "clear_first": {
+                        "type": "boolean",
+                        "description": "Whether to clear the field before typing. Default true."
+                    }
+                },
+                "required": ["thought_process", "selector", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_press_key",
+            "description": "Press a keyboard key in the browser. E.g., 'Enter', 'Tab', 'Escape', 'ArrowDown'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you need to press this key."
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "The key to press. E.g., 'Enter', 'Tab', 'Escape', 'ArrowDown', 'Backspace'."
+                    }
+                },
+                "required": ["thought_process", "key"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_text",
+            "description": "Get the visible text content of the current browser page. Useful for reading page content, checking what's displayed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you need to read the page content."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_state",
+            "description": "Get the current browser state: active tab title/URL, list of all open tabs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you need to check the browser state."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_new_tab",
+            "description": "Open a new browser tab, optionally navigating to a URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you need a new tab."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Optional URL to open in the new tab."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_close_tab",
+            "description": "Close the currently active browser tab.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you're closing this tab."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_wait_for",
+            "description": "Wait for an element or text to appear on the browser page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain what you're waiting for and why."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector to wait for. E.g., '#results', '.search-box'."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text content to wait for on the page."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max seconds to wait. Default 10."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_scroll",
+            "description": "Scroll the browser page up or down.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought_process": {
+                        "type": "string",
+                        "description": "MANDATORY. Explain why you need to scroll."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down"],
+                        "description": "Scroll direction."
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "description": "Number of scroll ticks (default 3)."
+                    }
+                },
+                "required": ["thought_process"]
+            }
+        }
     }
 ]
 
@@ -194,6 +421,27 @@ def execute_tool(name: str, args: dict) -> str:
         return json.dumps(result, indent=2)
     elif name == "switch_to_app":
         return switch_to_app(args.get("app_name", ""))
+    # ── Browser tools (Playwright CDP) ──
+    elif name == "browser_navigate":
+        return browser_navigate(args.get("url", ""))
+    elif name == "browser_click":
+        return browser_click(args.get("selector", ""))
+    elif name == "browser_type":
+        return browser_type(args.get("selector", ""), args.get("text", ""), args.get("clear_first", True))
+    elif name == "browser_press_key":
+        return browser_press_key(args.get("key", ""))
+    elif name == "browser_get_text":
+        return browser_get_text()
+    elif name == "browser_get_state":
+        return browser_get_state()
+    elif name == "browser_new_tab":
+        return browser_new_tab(args.get("url", ""))
+    elif name == "browser_close_tab":
+        return browser_close_tab()
+    elif name == "browser_wait_for":
+        return browser_wait_for(args.get("selector", ""), args.get("text", ""), args.get("timeout", 10))
+    elif name == "browser_scroll":
+        return browser_scroll(args.get("direction", "down"), args.get("amount", 3))
     else:
         return f"Error: Tool '{name}' not found."
 
@@ -560,6 +808,27 @@ OUTPUT FORMAT: Return ONLY a valid JSON array. No markdown, no explanation, no c
             return scroll_mouse(params.get("clicks", 0))
         elif action == "move_mouse":
             return move_mouse(params.get("x", 0), params.get("y", 0))
+        # ── Browser actions (Playwright CDP) ──
+        elif action == "browser_navigate":
+            return browser_navigate(params.get("url", ""))
+        elif action == "browser_click":
+            return browser_click(params.get("selector", ""))
+        elif action == "browser_type":
+            return browser_type(params.get("selector", ""), params.get("text", ""), params.get("clear_first", True))
+        elif action == "browser_press_key":
+            return browser_press_key(params.get("key", ""))
+        elif action == "browser_get_text":
+            return browser_get_text()
+        elif action == "browser_get_state":
+            return browser_get_state()
+        elif action == "browser_new_tab":
+            return browser_new_tab(params.get("url", ""))
+        elif action == "browser_close_tab":
+            return browser_close_tab()
+        elif action == "browser_wait_for":
+            return browser_wait_for(params.get("selector", ""), params.get("text", ""), params.get("timeout", 10))
+        elif action == "browser_scroll":
+            return browser_scroll(params.get("direction", "down"), params.get("amount", 3))
         else:
             return f"Unknown action: {action}"
 

@@ -20,87 +20,42 @@ variables:
 
 steps:
   #
-  # STEP 1: Switch to browser
+  # STEP 1: Navigate to DuckDuckGo via Playwright
   #
-  - action: switch_to_app
+  - action: browser_navigate
     params:
-      app_name: "{browser}"
-    description: "Bring the browser to foreground"
-    expect: "browser_foreground"
-    risk_level: "medium"
-    notes: >
-      Same as open_url — bring the browser to front. If not running, it will auto-launch.
-
-  #
-  # STEP 2: Focus address bar
-  # ─────────────────────────
-  # ctrl+l = address bar. NEVER ctrl+f.
-  #
-  - action: type_keyboard
-    params:
-      hotkey: "ctrl,l"
-    description: "Focus the address bar with Ctrl+L"
-    expect: "address_bar_focused"
-    risk_level: "medium"
-    notes: >
-      ALWAYS ctrl+l for the address bar. NEVER ctrl+f (that's find-in-page).
-      After this, the current URL is highlighted and ready to be replaced.
-
-  #
-  # STEP 3: Navigate to DuckDuckGo
-  #
-  - action: type_keyboard
-    params:
-      text: "duckduckgo.com"
-    description: "Type DuckDuckGo URL"
-    expect: "url_typed"
-    risk_level: "low"
-    notes: >
-      We go to DuckDuckGo because it's the user's default search engine.
-      Do NOT use google.com unless the user explicitly says "google it".
-
-  #
-  # STEP 4: Navigate
-  #
-  - action: type_keyboard
-    params:
-      hotkey: "enter"
-    description: "Navigate to DuckDuckGo"
+      url: "duckduckgo.com"
+    description: "Open DuckDuckGo via Playwright CDP"
     expect: "duckduckgo_loaded"
     risk_level: "low"
-    wait_for:
-      title_contains: "duckduckgo"
-      timeout: 15
     notes: >
-      Wait for the page to load. DuckDuckGo should show a search bar.
-      The wait_for condition ensures search bar is ready before typing.
+      Playwright navigates directly — no ctrl+l, no typing, no enter.
+      DuckDuckGo is the user's default search engine.
 
   #
-  # STEP 5: Type search query
-  # ──────────────────────────
-  # DuckDuckGo auto-focuses the search bar on load, so just type.
+  # STEP 2: Type search query into the search box
   #
-  - action: type_keyboard
+  - action: browser_type
     params:
+      selector: "input[name='q']"
       text: "{query}"
-    description: "Type the search query"
+    description: "Type the search query into the search box"
     expect: "query_typed"
     risk_level: "low"
     notes: >
-      DuckDuckGo auto-focuses the search input field when the page loads.
-      So you can immediately start typing without clicking anything.
-      
-      If the search field is NOT focused (rare), press Tab a few times
-      or click the search bar.
+      DuckDuckGo's search input has name="q".
+      Playwright finds it by CSS selector and types directly.
+      No need to wait for auto-focus or click the search bar.
 
   #
-  # STEP 6: Execute search
+  # STEP 3: Execute search
   #
-  - action: type_keyboard
+  - action: browser_press_key
     params:
-      hotkey: "enter"
+      key: "Enter"
     description: "Press Enter to search"
     expect: "search_results_visible"
     risk_level: "low"
     notes: >
-      Results should appear. The window title will change to include the query.
+      Results should appear. Much faster than the old 6-step approach
+      (switch_to_app → ctrl+l → type URL → enter → type query → enter).
